@@ -51,6 +51,20 @@ Non-secret env vars:
 
 For local development, copy `.env.example` to `.env`.
 
+## Secrets bootstrap
+
+Secret Manager entries must exist (with at least one version) before the first deploy, or Cloud Run will fail to resolve them. Use the bootstrap script to create any missing secrets and add values locally:
+
+```bash
+scripts/bootstrap-secrets.sh <gcp-project-id>
+```
+
+Verify what exists with:
+
+```bash
+gcloud secrets list
+```
+
 ## Database migrations
 
 Migrations use Alembic and require `DATABASE_URL`.

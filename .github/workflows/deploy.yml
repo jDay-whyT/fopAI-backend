@@ -37,6 +37,45 @@ jobs:
         run: |
           test -n "${{ secrets.GCP_PROJECT_ID }}" || (echo "Missing GCP_PROJECT_ID secret" && exit 1)
 
+      - name: Preflight Secret Manager
+        env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          required_secrets=(
+            DB_PASSWORD
+            OPENAI_API_KEY
+            TG_BOT_TOKEN
+            TELEGRAM_API_ID
+            TELEGRAM_API_HASH
+            TELETHON_STRING_SESSION
+          )
+          missing=()
+          no_versions=()
+
+          for secret in "${required_secrets[@]}"; do
+            if ! gcloud secrets describe "$secret" --project "$PROJECT_ID" >/dev/null 2>&1; then
+              missing+=("$secret")
+              continue
+            fi
+
+            if ! gcloud secrets versions list "$secret" --project "$PROJECT_ID" \
+              --filter="state=ENABLED" --format="value(name)" | head -n1 | grep -q .; then
+              no_versions+=("$secret")
+            fi
+          done
+
+          if (( ${#missing[@]} > 0 || ${#no_versions[@]} > 0 )); then
+            echo "Secret Manager preflight check failed."
+            if (( ${#missing[@]} > 0 )); then
+              echo "Missing secrets: ${missing[*]}"
+            fi
+            if (( ${#no_versions[@]} > 0 )); then
+              echo "Secrets with no enabled versions: ${no_versions[*]}"
+            fi
+            exit 1
+          fi
+
 
       - name: Build and push images
         env:
