@@ -73,7 +73,7 @@ jobs:
           TARGET_CHANNEL_ID="${TARGET_CHANNEL_ID:-$ADMIN_CHAT_ID}"
           APPROVER_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/approver:${{ github.sha }}"
 
-          gcloud run deploy approver \
+          gcloud run deploy approver --quiet \
             --image "$APPROVER_IMAGE" \
             --region "$REGION" \
             --platform managed \
