@@ -49,9 +49,9 @@ jobs:
           PROCESSOR_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/processor:${{ github.sha }}"
           APPROVER_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/approver:${{ github.sha }}"
 
-          docker build -t "$INGEST_IMAGE" -f services/ingest/Dockerfile .
-          docker build -t "$PROCESSOR_IMAGE" -f services/processor/Dockerfile .
-          docker build -t "$APPROVER_IMAGE" -f services/approver/Dockerfile .
+          docker build --progress=plain -t "$INGEST_IMAGE" -f services/ingest/Dockerfile .
+          docker build --progress=plain -t "$PROCESSOR_IMAGE" -f services/processor/Dockerfile .
+          docker build --progress=plain -t "$APPROVER_IMAGE" -f services/approver/Dockerfile .
 
           docker push "$INGEST_IMAGE"
           docker push "$PROCESSOR_IMAGE"
