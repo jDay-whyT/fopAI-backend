@@ -33,6 +33,11 @@ jobs:
       - name: Configure Docker
         run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
 
+      - name: Verify required secrets
+        run: |
+          test -n "${{ secrets.GCP_PROJECT_ID }}" || (echo "Missing GCP_PROJECT_ID secret" && exit 1)
+
+
       - name: Build and push images
         env:
           PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
