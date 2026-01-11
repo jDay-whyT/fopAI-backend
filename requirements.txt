@@ -5,7 +5,7 @@ pydantic-settings==2.6.1
 sqlalchemy==2.0.36
 alembic==1.14.0
 pg8000==1.31.2
-google-cloud-sql-connector==1.12.1
+cloud-sql-python-connector[pg8000]>=1.12,<2.0
 google-cloud-pubsub==2.26.0
 google-auth==2.36.0
 requests==2.32.3
