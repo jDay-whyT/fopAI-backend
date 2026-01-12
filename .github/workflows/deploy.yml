@@ -83,7 +83,6 @@ jobs:
           echo "PROJECT_ID=$PROJECT_ID"
           gcloud config list --project "$PROJECT_ID"
           gcloud auth list --project "$PROJECT_ID"
-          gcloud secrets describe DB_PASSWORD --project "$PROJECT_ID" >/dev/null && echo "DB_PASSWORD describe OK"
           required_secrets=(
             DB_PASSWORD
             OPENAI_API_KEY
@@ -93,10 +92,10 @@ jobs:
             TELETHON_STRING_SESSION
           )
           for secret in "${required_secrets[@]}"; do
-            if gcloud secrets describe "$secret" --project "$PROJECT_ID" >/dev/null 2>&1; then
-              enabled_count="$(gcloud secrets versions list "$secret" --project "$PROJECT_ID" \
-                --filter="state:ENABLED" --format="value(name)" | wc -l | tr -d ' ')"
-              echo "Secret $secret exists (enabled versions: $enabled_count)"
+            enabled_version="$(gcloud secrets versions list "$secret" --project "$PROJECT_ID" \
+              --filter="state:ENABLED" --format="value(name)" | head -n 1)"
+            if [ -n "$enabled_version" ]; then
+              echo "Secret $secret has enabled versions"
             else
               echo "Secret $secret missing"
             fi
@@ -116,27 +115,18 @@ jobs:
             TELETHON_STRING_SESSION
           )
           missing=()
-          no_versions=()
 
           for secret in "${required_secrets[@]}"; do
-            if ! gcloud secrets describe "$secret" --project "$PROJECT_ID" >/dev/null 2>&1; then
-              missing+=("$secret")
-              continue
-            fi
-
             if ! gcloud secrets versions list "$secret" --project "$PROJECT_ID" \
-              --filter="state:ENABLED" --format="value(name)" | head -n1 | grep -q .; then
-              no_versions+=("$secret")
+              --filter="state:ENABLED" --format="value(name)" | head -n 1 | grep -q .; then
+              missing+=("$secret")
             fi
           done
 
-          if (( ${#missing[@]} > 0 || ${#no_versions[@]} > 0 )); then
+          if (( ${#missing[@]} > 0 )); then
             echo "Secret Manager preflight check failed."
             if (( ${#missing[@]} > 0 )); then
               echo "Missing secrets: ${missing[*]}"
-            fi
-            if (( ${#no_versions[@]} > 0 )); then
-              echo "Secrets with no enabled versions: ${no_versions[*]}"
             fi
             exit 1
           fi
