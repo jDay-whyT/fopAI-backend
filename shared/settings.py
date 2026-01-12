@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     telegram_api_hash: str | None = Field(default=None, alias="TELEGRAM_API_HASH")
     telethon_string_session: str | None = Field(default=None, alias="TELETHON_STRING_SESSION")
 
-    openai_api_key: str = Field(alias="OPENAI_API_KEY")
+    openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     openai_text_model: str = Field(default="gpt-4o-mini", alias="OPENAI_TEXT_MODEL")
     openai_image_model: str = Field(default="gpt-image-1", alias="OPENAI_IMAGE_MODEL")
 
