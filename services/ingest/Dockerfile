@@ -1,7 +1,8 @@
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONPATH=/app
 WORKDIR /app
 
 RUN apt-get update \
@@ -21,4 +22,4 @@ RUN python -m pip install -U pip setuptools wheel \
 COPY shared ./shared
 COPY services/ingest ./services/ingest
 
-CMD ["python", "services/ingest/main.py"]
+CMD ["python", "-m", "services.ingest.main"]
