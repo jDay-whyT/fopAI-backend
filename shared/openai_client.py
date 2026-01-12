@@ -27,6 +27,8 @@ def get_editor() -> "OpenAIEditor | None":
 
 class OpenAIEditor:
     def __init__(self) -> None:
+        if not settings.openai_api_key:
+            raise ValueError("OPENAI_API_KEY is required to initialize the OpenAI client.")
         self.client = OpenAI(api_key=settings.openai_api_key)
 
     def summarize(self, text: str) -> dict[str, Any]:

@@ -36,7 +36,7 @@ Create these secrets in Secret Manager (values omitted):
 - `TELEGRAM_API_ID`
 - `TELEGRAM_API_HASH`
 - `TELETHON_STRING_SESSION`
-- `OPENAI_API_KEY`
+- `OPENAI_API_KEY` (required for processor/approver; not needed for ingest)
 - `TG_BOT_TOKEN`
 
 Non-secret env vars:
