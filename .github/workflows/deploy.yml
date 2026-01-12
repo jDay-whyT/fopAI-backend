@@ -9,6 +9,7 @@ env:
   PUBSUB_TOPIC: tg-raw-ingested
   DB_INSTANCE_CONNECTION_NAME: optimum-tea-481710-u3:us-central1:fopai-postgres
   DB_NAME: fopai
+  DEBUG: "1"
 
 jobs:
   deploy:
@@ -30,12 +31,43 @@ jobs:
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
 
+      - name: Configure gcloud project
+        env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          gcloud config set project "$PROJECT_ID"
+
       - name: Configure Docker
-        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
 
       - name: Verify required secrets
         run: |
           test -n "${{ secrets.GCP_PROJECT_ID }}" || (echo "Missing GCP_PROJECT_ID secret" && exit 1)
+
+      - name: Enable required APIs
+        env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          gcloud services enable \
+            run.googleapis.com \
+            artifactregistry.googleapis.com \
+            secretmanager.googleapis.com \
+            sqladmin.googleapis.com \
+            --project "$PROJECT_ID" \
+            --quiet
+
+      - name: Diagnostic gcloud context
+        if: env.DEBUG == '1'
+        env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          echo "PROJECT_ID=$PROJECT_ID"
+          gcloud config list
+          gcloud auth list
+          gcloud secrets list --project "$PROJECT_ID" --limit=20
 
       - name: Preflight Secret Manager
         env:
@@ -115,18 +147,20 @@ jobs:
           gcloud run deploy approver --quiet \
             --image "$APPROVER_IMAGE" \
             --region "$REGION" \
+            --project "$PROJECT_ID" \
             --platform managed \
             --allow-unauthenticated \
             --add-cloudsql-instances "$DB_INSTANCE_CONNECTION_NAME" \
             --set-env-vars DB_INSTANCE_CONNECTION_NAME="$DB_INSTANCE_CONNECTION_NAME",DB_NAME="$DB_NAME",DB_USER="$DB_USER",ADMIN_CHAT_ID="$ADMIN_CHAT_ID",TARGET_CHANNEL_ID="$TARGET_CHANNEL_ID" \
             --set-secrets DB_PASSWORD=DB_PASSWORD:latest,OPENAI_API_KEY=OPENAI_API_KEY:latest,TG_BOT_TOKEN=TG_BOT_TOKEN:latest
 
-          APPROVER_URL="$(gcloud run services describe approver --region "$REGION" --format='value(status.url)')"
+          APPROVER_URL="$(gcloud run services describe approver --region "$REGION" --project "$PROJECT_ID" --format='value(status.url)')"
           PROCESSOR_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/processor:${{ github.sha }}"
 
-          gcloud run deploy processor \
+          gcloud run deploy processor --quiet \
             --image "$PROCESSOR_IMAGE" \
             --region "$REGION" \
+            --project "$PROJECT_ID" \
             --platform managed \
             --allow-unauthenticated \
             --add-cloudsql-instances "$DB_INSTANCE_CONNECTION_NAME" \
@@ -146,17 +180,29 @@ jobs:
           set -euo pipefail
           INGEST_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/ingest:${{ github.sha }}"
 
-          gcloud run jobs update ingest \
-            --image "$INGEST_IMAGE" \
-            --region "$REGION" \
-            --add-cloudsql-instances "$DB_INSTANCE_CONNECTION_NAME" \
-            --set-env-vars DB_INSTANCE_CONNECTION_NAME="$DB_INSTANCE_CONNECTION_NAME",DB_NAME="$DB_NAME",DB_USER="$DB_USER",PUBSUB_TOPIC="$PUBSUB_TOPIC" \
-            --set-secrets DB_PASSWORD=DB_PASSWORD:latest,TELEGRAM_API_ID=TELEGRAM_API_ID:latest,TELEGRAM_API_HASH=TELEGRAM_API_HASH:latest,TELETHON_STRING_SESSION=TELETHON_STRING_SESSION:latest
+          if gcloud run jobs describe ingest --region "$REGION" --project "$PROJECT_ID" >/dev/null 2>&1; then
+            gcloud run jobs update ingest \
+              --image "$INGEST_IMAGE" \
+              --region "$REGION" \
+              --project "$PROJECT_ID" \
+              --add-cloudsql-instances "$DB_INSTANCE_CONNECTION_NAME" \
+              --set-env-vars DB_INSTANCE_CONNECTION_NAME="$DB_INSTANCE_CONNECTION_NAME",DB_NAME="$DB_NAME",DB_USER="$DB_USER",PUBSUB_TOPIC="$PUBSUB_TOPIC" \
+              --set-secrets DB_PASSWORD=DB_PASSWORD:latest,TELEGRAM_API_ID=TELEGRAM_API_ID:latest,TELEGRAM_API_HASH=TELEGRAM_API_HASH:latest,TELETHON_STRING_SESSION=TELETHON_STRING_SESSION:latest
+          else
+            gcloud run jobs create ingest \
+              --image "$INGEST_IMAGE" \
+              --region "$REGION" \
+              --project "$PROJECT_ID" \
+              --add-cloudsql-instances "$DB_INSTANCE_CONNECTION_NAME" \
+              --set-env-vars DB_INSTANCE_CONNECTION_NAME="$DB_INSTANCE_CONNECTION_NAME",DB_NAME="$DB_NAME",DB_USER="$DB_USER",PUBSUB_TOPIC="$PUBSUB_TOPIC" \
+              --set-secrets DB_PASSWORD=DB_PASSWORD:latest,TELEGRAM_API_ID=TELEGRAM_API_ID:latest,TELEGRAM_API_HASH=TELEGRAM_API_HASH:latest,TELETHON_STRING_SESSION=TELETHON_STRING_SESSION:latest
+          fi
 
       - name: Output URLs
         env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
           REGION: ${{ env.REGION }}
         run: |
           set -euo pipefail
-          echo "Processor URL: $(gcloud run services describe processor --region $REGION --format='value(status.url)')"
-          echo "Approver URL: $(gcloud run services describe approver --region $REGION --format='value(status.url)')"
+          echo "Processor URL: $(gcloud run services describe processor --region $REGION --project "$PROJECT_ID" --format='value(status.url)')"
+          echo "Approver URL: $(gcloud run services describe approver --region $REGION --project "$PROJECT_ID" --format='value(status.url)')"
