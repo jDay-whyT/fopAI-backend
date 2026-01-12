@@ -9,19 +9,19 @@ from sqlalchemy import insert, select, update
 from shared.db import db_session
 from shared.logging import configure_logging
 from shared.models import draft_posts, published_posts
-from shared.openai_client import OpenAIEditor
+from shared.openai_client import get_editor
 from shared.settings import settings
 from shared.telegram import TelegramBot
 
 logger = logging.getLogger("approver")
 app = FastAPI()
 bot = TelegramBot()
-editor = OpenAIEditor()
 
 
 @app.on_event("startup")
 def startup() -> None:
     configure_logging()
+    logger.info("Approver service starting up")
 
 
 @app.get("/healthz")
@@ -151,6 +151,9 @@ def _approve_draft(draft_id: int) -> None:
         if draft.status not in {"PENDING", "REJECTED"}:
             raise HTTPException(status_code=400, detail="draft not approvable")
 
+        editor = get_editor()
+        if editor is None:
+            raise HTTPException(status_code=503, detail="OpenAI client unavailable")
         image_url = editor.generate_image(draft.image_prompt or "Editorial photo")
         caption = _format_draft_text(draft)
         response = bot.send_photo(settings.resolved_target_channel_id(), image_url, caption)

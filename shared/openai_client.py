@@ -1,12 +1,28 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from openai import OpenAI
 
 from shared.prompts import EDITORIAL_PROMPT_UK
 from shared.settings import settings
+
+logger = logging.getLogger("openai_client")
+_editor: "OpenAIEditor | None" = None
+
+
+def get_editor() -> "OpenAIEditor | None":
+    global _editor
+    if _editor is not None:
+        return _editor
+    try:
+        _editor = OpenAIEditor()
+    except Exception:
+        logger.exception("Failed to initialize OpenAI client")
+        return None
+    return _editor
 
 
 class OpenAIEditor:
