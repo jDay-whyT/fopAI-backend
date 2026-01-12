@@ -45,18 +45,31 @@ jobs:
         run: |
           test -n "${{ secrets.GCP_PROJECT_ID }}" || (echo "Missing GCP_PROJECT_ID secret" && exit 1)
 
-      - name: Enable required APIs
+      - name: Preflight API enablement
         env:
           PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
         run: |
           set -euo pipefail
-          gcloud services enable \
-            run.googleapis.com \
-            artifactregistry.googleapis.com \
-            secretmanager.googleapis.com \
-            sqladmin.googleapis.com \
-            --project "$PROJECT_ID" \
-            --quiet
+          required_apis=(
+            run.googleapis.com
+            artifactregistry.googleapis.com
+            secretmanager.googleapis.com
+            sqladmin.googleapis.com
+          )
+          enabled_apis="$(gcloud services list --enabled --project "$PROJECT_ID" --format='value(config.name)')"
+          missing_apis=()
+
+          for api in "${required_apis[@]}"; do
+            if ! grep -qx "$api" <<<"$enabled_apis"; then
+              missing_apis+=("$api")
+            fi
+          done
+
+          if (( ${#missing_apis[@]} > 0 )); then
+            echo "Required APIs are not enabled in project $PROJECT_ID: ${missing_apis[*]}"
+            echo "Enable them once manually before running this workflow."
+            exit 1
+          fi
 
       - name: Diagnostic gcloud context
         if: env.DEBUG == '1'
