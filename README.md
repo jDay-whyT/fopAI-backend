@@ -17,7 +17,7 @@ This repo contains a Telegram news pipeline on GCP with MTProto ingest, GPT proc
 
 ## Required APIs
 
-Enable these APIs in your GCP project:
+Enable these APIs in your GCP project (one-time manual setup; CI will only check and will not enable APIs):
 
 - Cloud Run
 - Artifact Registry
@@ -117,6 +117,7 @@ gcloud scheduler jobs create http ingest-15m \
 ## CI/CD (GitHub Actions)
 
 The workflow uses Workload Identity Federation with manual `workflow_dispatch`.
+Make sure the required APIs are enabled manually before running the workflow; CI is deploy-only and will fail fast if APIs are missing.
 
 Required GitHub secrets:
 
