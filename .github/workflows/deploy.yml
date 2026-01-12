@@ -9,6 +9,7 @@ env:
   PUBSUB_TOPIC: tg-raw-ingested
   DB_INSTANCE_CONNECTION_NAME: optimum-tea-481710-u3:us-central1:fopai-postgres
   DB_NAME: fopai
+  DB_USER: postgres
   DEBUG: "1"
 
 jobs:
@@ -159,7 +160,6 @@ jobs:
           DB_INSTANCE_CONNECTION_NAME: ${{ env.DB_INSTANCE_CONNECTION_NAME }}
           DB_NAME: ${{ env.DB_NAME }}
           PUBSUB_TOPIC: ${{ env.PUBSUB_TOPIC }}
-          DB_USER: ${{ secrets.DB_USER }}
           ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID || '-3277785413' }}
           TARGET_CHANNEL_ID: ${{ secrets.TARGET_CHANNEL_ID }}
         run: |
@@ -198,7 +198,6 @@ jobs:
           DB_INSTANCE_CONNECTION_NAME: ${{ env.DB_INSTANCE_CONNECTION_NAME }}
           DB_NAME: ${{ env.DB_NAME }}
           PUBSUB_TOPIC: ${{ env.PUBSUB_TOPIC }}
-          DB_USER: ${{ secrets.DB_USER }}
         run: |
           set -euo pipefail
           INGEST_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/ingest:${{ github.sha }}"
