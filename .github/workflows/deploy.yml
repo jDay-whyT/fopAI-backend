@@ -208,7 +208,7 @@ jobs:
               --image "$INGEST_IMAGE" \
               --region "$REGION" \
               --project "$PROJECT_ID" \
-              --add-cloudsql-instances "$DB_INSTANCE_CONNECTION_NAME" \
+              --set-cloudsql-instances "$DB_INSTANCE_CONNECTION_NAME" \
               --set-env-vars DB_INSTANCE_CONNECTION_NAME="$DB_INSTANCE_CONNECTION_NAME",DB_NAME="$DB_NAME",DB_USER="$DB_USER",PUBSUB_TOPIC="$PUBSUB_TOPIC" \
               --set-secrets DB_PASSWORD=DB_PASSWORD:latest,TELEGRAM_API_ID=TELEGRAM_API_ID:latest,TELEGRAM_API_HASH=TELEGRAM_API_HASH:latest,TELETHON_STRING_SESSION=TELETHON_STRING_SESSION:latest
           else
@@ -216,7 +216,7 @@ jobs:
               --image "$INGEST_IMAGE" \
               --region "$REGION" \
               --project "$PROJECT_ID" \
-              --add-cloudsql-instances "$DB_INSTANCE_CONNECTION_NAME" \
+              --set-cloudsql-instances "$DB_INSTANCE_CONNECTION_NAME" \
               --set-env-vars DB_INSTANCE_CONNECTION_NAME="$DB_INSTANCE_CONNECTION_NAME",DB_NAME="$DB_NAME",DB_USER="$DB_USER",PUBSUB_TOPIC="$PUBSUB_TOPIC" \
               --set-secrets DB_PASSWORD=DB_PASSWORD:latest,TELEGRAM_API_ID=TELEGRAM_API_ID:latest,TELEGRAM_API_HASH=TELEGRAM_API_HASH:latest,TELETHON_STRING_SESSION=TELETHON_STRING_SESSION:latest
           fi
