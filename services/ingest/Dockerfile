@@ -20,6 +20,6 @@ RUN python -m pip install -U pip setuptools wheel \
     && pip install --no-cache-dir --verbose -r requirements.txt
 
 COPY shared ./shared
-COPY services/ingest ./services/ingest
+COPY services ./services
 
 CMD ["python", "-m", "services.ingest.main"]
