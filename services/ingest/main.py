@@ -90,6 +90,7 @@ async def ingest_once() -> None:
     if not (settings.telegram_api_id and settings.telegram_api_hash):
         raise RuntimeError("TELEGRAM_API_ID, TELEGRAM_API_HASH are required")
     telethon_string_session = _validate_telethon_string_session(settings.telethon_string_session)
+    logger.info("telethon mode=user")
 
     publisher = _get_pubsub_client()
     topic_path = _topic_path(publisher)
