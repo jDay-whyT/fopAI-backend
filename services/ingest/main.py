@@ -22,6 +22,22 @@ from shared.settings import settings
 SOURCES = ["Minfin_com_ua", "verkhovnaradaukrainy", "tax_gov_ua", "nbu_ua"]
 
 logger = logging.getLogger("ingest")
+TELETHON_STRING_SESSION_PREFIX = "1"
+
+
+def _validate_telethon_string_session(value: str | None) -> str:
+    cleaned = (value or "").strip()
+    if not cleaned:
+        raise RuntimeError(
+            "TELETHON_STRING_SESSION is required. Set it to a Telethon string session "
+            f"(starts with '{TELETHON_STRING_SESSION_PREFIX}')."
+        )
+    if not cleaned.startswith(TELETHON_STRING_SESSION_PREFIX):
+        raise RuntimeError(
+            "TELETHON_STRING_SESSION looks invalid. Expected a Telethon string session "
+            f"starting with '{TELETHON_STRING_SESSION_PREFIX}'."
+        )
+    return cleaned
 
 
 def _get_pubsub_client() -> pubsub_v1.PublisherClient:
@@ -71,14 +87,15 @@ def _insert_raw_messages(messages: Iterable[dict]) -> list[int]:
 
 async def ingest_once() -> None:
     configure_logging()
-    if not (settings.telegram_api_id and settings.telegram_api_hash and settings.telethon_string_session):
-        raise RuntimeError("TELEGRAM_API_ID, TELEGRAM_API_HASH, TELETHON_STRING_SESSION are required")
+    if not (settings.telegram_api_id and settings.telegram_api_hash):
+        raise RuntimeError("TELEGRAM_API_ID, TELEGRAM_API_HASH are required")
+    telethon_string_session = _validate_telethon_string_session(settings.telethon_string_session)
 
     publisher = _get_pubsub_client()
     topic_path = _topic_path(publisher)
 
     async with TelegramClient(
-        StringSession(settings.telethon_string_session),
+        StringSession(telethon_string_session),
         settings.telegram_api_id,
         settings.telegram_api_hash,
     ) as client:
