@@ -32,7 +32,6 @@ Enable these APIs in your GCP project (one-time manual setup; CI will only check
 Create these secrets in Secret Manager (values omitted):
 
 - `DB_PASSWORD`
-- `DB_USER`
 - `TELEGRAM_API_ID`
 - `TELEGRAM_API_HASH`
 - `TELETHON_STRING_SESSION`
@@ -43,6 +42,7 @@ Non-secret env vars:
 
 - `DB_INSTANCE_CONNECTION_NAME` (fixed value above)
 - `DB_NAME` (fixed value above)
+- `DB_USER` (defaults to `postgres`)
 - `ADMIN_CHAT_ID` (default `-3277785413`)
 - `TARGET_CHANNEL_ID` (optional; defaults to admin chat)
 - `PUBSUB_TOPIC` (`tg-raw-ingested`)
@@ -124,7 +124,6 @@ Required GitHub secrets:
 - `GCP_PROJECT_ID`
 - `GCP_WORKLOAD_IDENTITY_PROVIDER`
 - `GCP_SERVICE_ACCOUNT`
-- `DB_USER`
 - `ADMIN_CHAT_ID` (optional; leave empty to use default)
 - `TARGET_CHANNEL_ID` (optional; leave empty to post to admin chat)
 
