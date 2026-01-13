@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+import sys
 from logging.config import fileConfig
 
-from alembic import context
+from alembic import command, context
 from sqlalchemy import engine_from_config, pool
 
 from shared.models import metadata
@@ -12,6 +13,10 @@ config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
+
+if os.getenv("ALEMBIC_STAMP_ONLY") == "1":
+    command.stamp(config, "head")
+    sys.exit(0)
 
 
 def get_url() -> str:
