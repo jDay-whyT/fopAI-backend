@@ -18,8 +18,13 @@ if [[ -z "${DATABASE_URL:-}" ]]; then
   fi
 
   DB_USER_VALUE="${DB_USER:-postgres}"
-  DATABASE_URL="postgresql+pg8000://${DB_USER_VALUE}:${DB_PASSWORD}@/${DB_NAME}?unix_sock=/cloudsql/${DB_INSTANCE_CONNECTION_NAME}"
+  SOCKET_FILE="/cloudsql/${DB_INSTANCE_CONNECTION_NAME}/.s.PGSQL.5432"
+  DATABASE_URL="postgresql+pg8000://${DB_USER_VALUE}:${DB_PASSWORD}@/${DB_NAME}?unix_sock=${SOCKET_FILE}"
   export DATABASE_URL
+
+  if [[ "${DEBUG:-}" == "1" ]]; then
+    ls -la "/cloudsql/${DB_INSTANCE_CONNECTION_NAME}"
+  fi
 fi
 
 alembic upgrade head
