@@ -9,7 +9,7 @@ class Settings(BaseSettings):
 
     db_instance_connection_name: str | None = Field(default=None, alias="DB_INSTANCE_CONNECTION_NAME")
     db_name: str = Field(alias="DB_NAME")
-    db_user: str = Field(alias="DB_USER")
+    db_user: str = Field(default="postgres", alias="DB_USER")
     db_password: str = Field(alias="DB_PASSWORD")
     database_url: str | None = Field(default=None, alias="DATABASE_URL")
 
