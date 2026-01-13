@@ -30,8 +30,24 @@ if os.getenv("ALEMBIC_STAMP_ONLY") == "1":
 
 def get_url() -> str:
     url = os.getenv("DATABASE_URL")
-    if not url:
-        raise RuntimeError("DATABASE_URL is required for migrations")
+    if url:
+        return url
+
+    instance_connection_name = os.getenv("DB_INSTANCE_CONNECTION_NAME")
+    if not instance_connection_name:
+        raise RuntimeError("DB_INSTANCE_CONNECTION_NAME is required when DATABASE_URL is not set")
+
+    db_name = os.getenv("DB_NAME")
+    if not db_name:
+        raise RuntimeError("DB_NAME is required when DATABASE_URL is not set")
+
+    db_password = os.getenv("DB_PASSWORD")
+    if not db_password:
+        raise RuntimeError("DB_PASSWORD is required when DATABASE_URL is not set")
+
+    db_user = os.getenv("DB_USER", "postgres")
+    socket_file = f"/cloudsql/{instance_connection_name}/.s.PGSQL.5432"
+    url = f"postgresql+pg8000://{db_user}:{db_password}@/{db_name}?unix_sock={socket_file}"
     return url
 
 
