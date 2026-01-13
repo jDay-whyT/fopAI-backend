@@ -8,6 +8,15 @@ from alembic import command, context
 from sqlalchemy import engine_from_config, pool
 
 from shared.models import metadata
+import os
+
+if os.getenv("ALEMBIC_STAMP_ONLY") == "1":
+    from alembic.config import Config
+    from alembic.command import stamp
+
+    cfg = Config("alembic.ini")
+    stamp(cfg, "head")
+    raise SystemExit(0)
 
 config = context.config
 
