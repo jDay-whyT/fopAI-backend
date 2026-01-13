@@ -10,7 +10,7 @@ from google.cloud import pubsub_v1
 from sqlalchemy import insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from telethon import TelegramClient
-from telethon.errors import AuthKeyDuplicatedError, FloodWaitError
+from telethon.errors import AuthKeyDuplicatedError, BotMethodInvalidError, FloodWaitError
 from telethon.sessions import StringSession
 
 from shared.db import db_session
@@ -95,14 +95,14 @@ async def ingest_once() -> None:
     publisher = _get_pubsub_client()
     topic_path = _topic_path(publisher)
 
-    if settings.tg_bot_token:
-        logger.warning("TG_BOT_TOKEN is ignored by ingest; using StringSession with API ID/hash only.")
     try:
         async with TelegramClient(
             StringSession(telethon_string_session),
             settings.telegram_api_id,
             settings.telegram_api_hash,
         ) as client:
+            if client.is_bot():
+                raise RuntimeError("Ingest must not run as bot")
             for source in SOURCES:
                 attempt = 0
                 while True:
@@ -145,6 +145,9 @@ async def ingest_once() -> None:
                         logger.error(
                             "Auth key duplicated. Stop ingest and create a fresh Telethon string session."
                         )
+                        raise SystemExit(1)
+                    except BotMethodInvalidError:
+                        logger.error("BotMethodInvalidError: ingest is configured as bot. Exiting.")
                         raise SystemExit(1)
                     except FloodWaitError as exc:
                         logger.warning("Flood wait", extra={"seconds": exc.seconds})
