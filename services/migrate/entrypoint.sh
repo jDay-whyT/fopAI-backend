@@ -27,4 +27,8 @@ if [[ -z "${DATABASE_URL:-}" ]]; then
   fi
 fi
 
-alembic upgrade head
+if [[ "${ALEMBIC_STAMP_ONLY:-}" == "1" ]]; then
+  alembic stamp head
+else
+  alembic upgrade head
+fi
