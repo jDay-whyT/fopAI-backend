@@ -11,7 +11,7 @@ from google.cloud import pubsub_v1
 from sqlalchemy import insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from telethon import TelegramClient
-from telethon.errors import AuthKeyDuplicatedError, BotMethodInvalidError
+from telethon.errors import AuthKeyDuplicatedError, BotMethodInvalidError, FloodWaitError
 from telethon.sessions import StringSession
 
 from shared.db import db_session
@@ -20,6 +20,7 @@ from shared.models import offsets, raw_messages
 from shared.settings import settings
 
 SOURCES = ["Minfin_com_ua", "verkhovnaradaukrainy", "tax_gov_ua", "nbu_ua"]
+MAX_MESSAGES_PER_SOURCE = 100
 
 logger = logging.getLogger("ingest")
 TELETHON_STRING_SESSION_PREFIX = "1"
@@ -119,7 +120,13 @@ async def ingest_once() -> None:
 
                     new_messages = []
                     max_message_id = last_message_id
-                    async for message in client.iter_messages(entity, min_id=last_message_id, reverse=True):
+                    async for message in client.iter_messages(
+                        entity,
+                        min_id=last_message_id,
+                        offset_id=last_message_id,
+                        reverse=True,
+                        limit=MAX_MESSAGES_PER_SOURCE,
+                    ):
                         if message.id is None:
                             continue
                         max_message_id = max(max_message_id, message.id)
@@ -151,6 +158,12 @@ async def ingest_once() -> None:
                 except BotMethodInvalidError:
                     logger.error("BotMethodInvalidError: ingest is configured as bot. Exiting.")
                     raise SystemExit(1)
+                except FloodWaitError as exc:
+                    logger.warning(
+                        "Flood wait hit; exiting ingest.",
+                        extra={"source": source, "wait_seconds": exc.seconds},
+                    )
+                    raise SystemExit(0)
                 except Exception as exc:
                     logger.exception("Failed ingest", extra={"source": source, "error": str(exc)})
                     raise SystemExit(1)
@@ -169,6 +182,9 @@ async def ingest_once() -> None:
     except BotMethodInvalidError:
         logger.error("BotMethodInvalidError: ingest is configured as bot. Exiting.")
         raise SystemExit(1)
+    except FloodWaitError as exc:
+        logger.warning("Flood wait hit; exiting ingest.", extra={"wait_seconds": exc.seconds})
+        raise SystemExit(0)
 
 
 if __name__ == "__main__":
