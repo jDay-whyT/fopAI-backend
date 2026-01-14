@@ -44,6 +44,11 @@ async def notify(payload: dict) -> dict[str, str]:
     return {"status": "sent"}
 
 
+@app.get("/telegram/webhook")
+async def telegram_webhook_validation() -> dict[str, bool]:
+    return {"ok": True}
+
+
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: str | None = Header(default=None)) -> dict[str, str]:
     if settings.tg_bot_token and x_telegram_bot_api_secret_token and x_telegram_bot_api_secret_token != settings.tg_bot_token:
