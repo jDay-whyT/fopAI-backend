@@ -44,16 +44,17 @@ def pubsub_push(payload: dict, authorization: str | None = Header(default=None))
             logger.info("Draft already exists", extra={"raw_id": raw_id})
             return {"status": "exists"}
 
-    draft_id = None
     with db_session() as connection:
         raw = connection.execute(select(raw_messages).where(raw_messages.c.id == raw_id)).fetchone()
         if not raw:
             raise HTTPException(status_code=404, detail="raw message not found")
+        raw_text = raw.text or ""
 
-        try:
-            summary = editor.summarize(raw.text or "")
-        except Exception as exc:
-            logger.exception("OpenAI failure", extra={"raw_id": raw_id})
+    try:
+        summary = editor.summarize(raw_text)
+    except Exception as exc:
+        logger.exception("OpenAI failure", extra={"raw_id": raw_id})
+        with db_session() as connection:
             connection.execute(
                 pg_insert(draft_posts)
                 .values(
@@ -63,14 +64,16 @@ def pubsub_push(payload: dict, authorization: str | None = Header(default=None))
                 )
                 .on_conflict_do_nothing(index_elements=["raw_id"])
             )
-            raise
+        raise
 
-        status = "PENDING"
-        reason = None
-        if summary.get("skip"):
-            status = "SKIPPED"
-            reason = summary.get("reason")
+    status = "PENDING"
+    reason = None
+    if summary.get("skip"):
+        status = "SKIPPED"
+        reason = summary.get("reason")
 
+    draft_id = None
+    with db_session() as connection:
         result = connection.execute(
             pg_insert(draft_posts)
             .values(
