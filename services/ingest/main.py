@@ -86,6 +86,7 @@ def _insert_raw_messages(messages: Iterable[dict]) -> list[int]:
 
 
 async def ingest_once() -> None:
+    logging.basicConfig(level=logging.INFO, force=True)
     configure_logging()
     if not (settings.telegram_api_id and settings.telegram_api_hash):
         raise RuntimeError("TELEGRAM_API_ID, TELEGRAM_API_HASH are required")
