@@ -5,8 +5,8 @@ import logging
 import requests
 
 from fastapi import FastAPI, Header, HTTPException
-from sqlalchemy import insert, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from shared.db import db_session
 from shared.logging import configure_logging
@@ -55,11 +55,13 @@ def pubsub_push(payload: dict, authorization: str | None = Header(default=None))
         except Exception as exc:
             logger.exception("OpenAI failure", extra={"raw_id": raw_id})
             connection.execute(
-                insert(draft_posts).values(
+                pg_insert(draft_posts)
+                .values(
                     raw_id=raw_id,
                     status="FAILED",
                     error=str(exc),
                 )
+                .on_conflict_do_nothing(index_elements=["raw_id"])
             )
             raise
 
@@ -69,24 +71,26 @@ def pubsub_push(payload: dict, authorization: str | None = Header(default=None))
             status = "SKIPPED"
             reason = summary.get("reason")
 
-        try:
-            result = connection.execute(
-                insert(draft_posts).values(
-                    raw_id=raw_id,
-                    title=summary.get("title"),
-                    body=summary.get("body"),
-                    image_prompt=summary.get("image_prompt"),
-                    status=status,
-                    reason=reason,
-                    model=summary.get("_model"),
-                    tokens=summary.get("_tokens"),
-                ).returning(draft_posts.c.id)
-            ).fetchone()
-        except IntegrityError:
-            logger.info("Draft already inserted", extra={"raw_id": raw_id})
-            return {"status": "exists"}
+        result = connection.execute(
+            pg_insert(draft_posts)
+            .values(
+                raw_id=raw_id,
+                title=summary.get("title"),
+                body=summary.get("body"),
+                image_prompt=summary.get("image_prompt"),
+                status=status,
+                reason=reason,
+                model=summary.get("_model"),
+                tokens=summary.get("_tokens"),
+            )
+            .on_conflict_do_nothing(index_elements=["raw_id"])
+            .returning(draft_posts.c.id)
+        ).fetchone()
         if result:
             draft_id = result[0]
+        else:
+            logger.info("Draft already inserted", extra={"raw_id": raw_id})
+            return {"status": "exists"}
 
     if status == "PENDING" and draft_id and settings.approver_notify_url:
         try:
