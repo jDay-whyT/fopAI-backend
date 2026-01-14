@@ -21,5 +21,6 @@ RUN python -m pip install -U pip setuptools wheel \
 
 COPY shared ./shared
 COPY services/approver ./services/approver
+COPY tools ./tools
 
 CMD ["uvicorn", "services.approver.main:app", "--host", "0.0.0.0", "--port", "8080"]
