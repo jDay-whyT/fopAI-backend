@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     openai_image_model: str = Field(default="gpt-image-1", alias="OPENAI_IMAGE_MODEL")
 
     tg_bot_token: str | None = Field(default=None, alias="TG_BOT_TOKEN")
-    admin_chat_id: int = Field(default=-3277785413, alias="ADMIN_CHAT_ID")
+    admin_chat_id: int | None = Field(default=None, alias="ADMIN_CHAT_ID")
     target_channel_id: int | None = Field(default=None, alias="TARGET_CHANNEL_ID")
 
     pubsub_topic: str = Field(default="tg-raw-ingested", alias="PUBSUB_TOPIC")
@@ -31,7 +31,7 @@ class Settings(BaseSettings):
 
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
-    def resolved_target_channel_id(self) -> int:
+    def resolved_target_channel_id(self) -> int | None:
         return self.target_channel_id or self.admin_chat_id
 
 
