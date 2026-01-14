@@ -31,7 +31,7 @@ draft_posts = Table(
     "draft_posts",
     metadata,
     Column("id", BigInteger, primary_key=True, autoincrement=True),
-    Column("raw_id", BigInteger, ForeignKey("raw_messages.id"), unique=True),
+    Column("raw_id", BigInteger, ForeignKey("raw_messages.id", ondelete="CASCADE"), unique=True),
     Column("title", Text, nullable=True),
     Column("body", Text, nullable=True),
     Column("image_prompt", Text, nullable=True),
