@@ -22,7 +22,14 @@ def _create_connector() -> Connector:
 
 def _create_engine() -> Engine:
     if settings.database_url:
-        return create_engine(settings.database_url, pool_pre_ping=True)
+        return create_engine(
+            settings.database_url,
+            pool_pre_ping=True,
+            pool_recycle=300,
+            pool_timeout=10,
+            pool_size=1,
+            max_overflow=0,
+        )
 
     if not settings.db_instance_connection_name:
         raise RuntimeError("DB_INSTANCE_CONNECTION_NAME is required when DATABASE_URL is not set")
@@ -42,8 +49,10 @@ def _create_engine() -> Engine:
         "postgresql+pg8000://",
         creator=get_conn,
         pool_pre_ping=True,
-        pool_size=5,
-        max_overflow=2,
+        pool_recycle=300,
+        pool_timeout=10,
+        pool_size=1,
+        max_overflow=0,
     )
 
 
