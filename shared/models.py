@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from sqlalchemy import BigInteger, Column, DateTime, ForeignKey, Integer, MetaData, String, Table, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy import text
 from sqlalchemy.sql import func
 
 metadata = MetaData()
@@ -23,7 +22,7 @@ raw_messages = Table(
     Column("message_id", Integer, nullable=False),
     Column("date", DateTime(timezone=True), nullable=True),
     Column("text", Text, nullable=True),
-    Column("meta_json", JSONB, nullable=False, server_default=text("'{}'::jsonb")),
+    Column("meta_json", JSONB, nullable=True),
     Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
     UniqueConstraint("chat_id", "message_id", name="uq_raw_messages_chat_message"),
 )
