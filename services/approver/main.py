@@ -47,17 +47,45 @@ async def notify(payload: dict) -> dict[str, str]:
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: str | None = Header(default=None)) -> dict[str, str]:
     if settings.tg_bot_token and x_telegram_bot_api_secret_token and x_telegram_bot_api_secret_token != settings.tg_bot_token:
-        raise HTTPException(status_code=401, detail="Invalid secret token")
+        logger.warning("telegram_webhook_invalid_secret")
+        return {"status": "unauthorized"}
 
-    update = await request.json()
+    try:
+        update = await request.json()
+    except Exception as exc:  # noqa: BLE001 - log and continue for webhook resilience
+        logger.warning("telegram_webhook_invalid_json", extra={"error": str(exc)})
+        return {"status": "invalid_json"}
+
+    if not isinstance(update, dict):
+        logger.warning("telegram_webhook_unexpected_payload")
+        return {"status": "ignored"}
+
+    update_id = update.get("update_id")
     if "callback_query" in update:
-        return _handle_callback(update["callback_query"])
-    if "message" in update:
-        return _handle_message(update["message"])
+        update_type = "callback_query"
+    elif "message" in update:
+        update_type = "message"
+    else:
+        update_type = "other"
+
+    logger.info("telegram_webhook_update", extra={"update_id": update_id, "update_type": update_type})
+
+    try:
+        if update_type == "callback_query":
+            return _handle_callback(update["callback_query"])
+        if update_type == "message":
+            return _handle_message(update["message"])
+    except Exception as exc:  # noqa: BLE001 - avoid webhook errors to Telegram
+        logger.warning("telegram_webhook_handler_error", extra={"error": str(exc), "update_type": update_type})
+        return {"status": "error"}
+
     return {"status": "ignored"}
 
 
 def _send_review_message(draft: Any) -> None:
+    if not settings.admin_chat_id:
+        logger.info("admin_chat_id_missing")
+        return
     text = _format_draft_text(draft)
     keyboard = {
         "inline_keyboard": [
@@ -74,14 +102,16 @@ def _send_review_message(draft: Any) -> None:
 def _format_draft_text(draft: Any) -> str:
     title = html.escape(draft.title or "(no title)")
     body = html.escape(draft.body or "")
-    return f"<b>{title}</b>\n\n{body}".strip()
+    header = f"Draft ready for review: {draft.id}"
+    return f"{header}\n\n<b>{title}</b>\n\n{body}".strip()
 
 
 def _handle_callback(callback: dict) -> dict[str, str]:
     data = callback.get("data", "")
     callback_id = callback.get("id")
     if not callback_id:
-        raise HTTPException(status_code=400, detail="callback id missing")
+        logger.warning("telegram_callback_missing_id")
+        return {"status": "ignored"}
 
     if data.startswith("approve:"):
         draft_id = int(data.split(":", 1)[1])
@@ -110,10 +140,15 @@ def _handle_message(message: dict) -> dict[str, str]:
     body_text = parts[1] if len(parts) > 1 else ""
     header_parts = header.split(" ")
     if len(header_parts) < 2:
-        raise HTTPException(status_code=400, detail="Usage: /edit <draft_id> <text>")
+        logger.warning("telegram_edit_missing_draft_id")
+        return {"status": "ignored"}
     draft_id_str = header_parts[1]
     rest = header_parts[2:]
-    draft_id = int(draft_id_str)
+    try:
+        draft_id = int(draft_id_str)
+    except ValueError:
+        logger.warning("telegram_edit_invalid_draft_id", extra={"draft_id": draft_id_str})
+        return {"status": "ignored"}
     if rest:
         body_text = " ".join(rest) + ("\n" + body_text if body_text else "")
     title, body = _parse_title_body(body_text)

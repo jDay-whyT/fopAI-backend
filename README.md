@@ -43,7 +43,7 @@ Non-secret env vars:
 - `DB_INSTANCE_CONNECTION_NAME` (fixed value above)
 - `DB_NAME` (fixed value above)
 - `DB_USER` (defaults to `postgres`)
-- `ADMIN_CHAT_ID` (default `-3277785413`)
+- `ADMIN_CHAT_ID` (required for review notifications)
 - `TARGET_CHANNEL_ID` (optional; defaults to admin chat)
 - `PUBSUB_TOPIC` (`tg-raw-ingested`)
 - `PUBSUB_VERIFICATION_AUDIENCE` (Cloud Run service URL for processor)
@@ -100,6 +100,18 @@ Set the Telegram webhook for the approver service:
 curl -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/setWebhook" \
   -d "url=https://APPROVER_URL/telegram/webhook" \
   -d "secret_token=$TG_BOT_TOKEN"
+```
+
+To set the webhook via a Cloud Run Job using the repo image, run:
+
+```bash
+gcloud run jobs create set-telegram-webhook \
+  --image IMAGE_URL \
+  --command python \
+  --args tools/set_webhook.py \
+  --set-env-vars TG_BOT_TOKEN=$TG_BOT_TOKEN,WEBHOOK_URL=$WEBHOOK_URL
+
+gcloud run jobs execute set-telegram-webhook
 ```
 
 ## Cloud Scheduler
