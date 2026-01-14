@@ -16,16 +16,18 @@ def main() -> int:
         return 1
 
     if action == "info":
+        endpoint = "getWebhookInfo"
         response = requests.get(
-            f"https://api.telegram.org/bot{token}/getWebhookInfo",
+            f"https://api.telegram.org/bot{token}/{endpoint}",
             timeout=30,
         )
     elif action == "set":
         if not webhook_url:
             print("Missing WEBHOOK_URL", file=sys.stderr)
             return 1
+        endpoint = "setWebhook"
         response = requests.post(
-            f"https://api.telegram.org/bot{token}/setWebhook",
+            f"https://api.telegram.org/bot{token}/{endpoint}",
             data={"url": webhook_url, "secret_token": token},
             timeout=30,
         )
@@ -36,16 +38,11 @@ def main() -> int:
     try:
         payload = response.json()
     except ValueError:
-        payload = {"ok": False, "description": response.text}
+        payload = response.text
     print(f"status_code={response.status_code}")
     print(payload)
-    ok = payload.get("ok")
-    description = payload.get("description")
-    if response.status_code != 200 or ok is not True:
-        print(f"telegram_error {description}")
-        return 1
-    print(f"ok={ok} description={description}")
-    return 0
+    ok = isinstance(payload, dict) and payload.get("ok") is True
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
