@@ -98,6 +98,10 @@ async def ingest_once() -> None:
 
     publisher = _get_pubsub_client()
     topic_path = _topic_path(publisher)
+    fetched_count = 0
+    inserted_count = 0
+    to_publish_count = 0
+    published_count = 0
 
     try:
         client = TelegramClient(
@@ -140,13 +144,33 @@ async def ingest_once() -> None:
                             }
                         )
 
+                    fetched_count += len(new_messages)
                     inserted_ids = _insert_raw_messages(new_messages)
+                    inserted_count += len(inserted_ids)
                     if max_message_id > last_message_id:
                         _update_offset(chat_id, max_message_id)
 
+                    to_publish_count += len(inserted_ids)
                     for raw_id in inserted_ids:
                         payload = {"raw_id": raw_id}
-                        publisher.publish(topic_path, json.dumps(payload).encode("utf-8"))
+                        try:
+                            future = publisher.publish(topic_path, json.dumps(payload).encode("utf-8"))
+                            message_id = future.result(timeout=15)
+                            published_count += 1
+                            logger.info(
+                                "Published Pub/Sub message",
+                                extra={"message_id": message_id, "raw_id": raw_id, "source": source},
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "Failed to publish Pub/Sub message",
+                                extra={
+                                    "source": source,
+                                    "raw_id": raw_id,
+                                    "error_type": type(exc).__name__,
+                                    "error": str(exc),
+                                },
+                            )
 
                     logger.info(
                         "Ingested messages",
@@ -167,6 +191,16 @@ async def ingest_once() -> None:
                 except Exception as exc:
                     logger.exception("Failed ingest", extra={"source": source, "error": str(exc)})
                     raise SystemExit(1)
+        finally:
+            logger.info(
+                "Ingest totals",
+                extra={
+                    "fetched_count": fetched_count,
+                    "inserted_count": inserted_count,
+                    "to_publish_count": to_publish_count,
+                    "published_count": published_count,
+                },
+            )
         finally:
             await client.disconnect()
     except ValueError as exc:
