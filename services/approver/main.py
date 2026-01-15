@@ -8,7 +8,7 @@ from sqlalchemy import insert, select, update
 
 from shared.db import db_session
 from shared.logging import configure_logging
-from shared.models import draft_posts, published_posts
+from shared.models import draft_posts, published_posts, raw_messages
 from shared.openai_client import get_editor
 from shared.settings import settings
 from shared.telegram import TelegramBot
@@ -390,9 +390,12 @@ def _parse_callback_data(data: str) -> tuple[int, str] | None:
 
 def _update_draft_meta(draft_id: int, updates: dict[str, Any]) -> None:
     with db_session() as connection:
-        draft = connection.execute(select(draft_posts.c.meta_json).where(draft_posts.c.id == draft_id)).fetchone()
+        draft = connection.execute(
+            select(raw_messages.c.id, raw_messages.c.meta_json)
+            .select_from(draft_posts.join(raw_messages, draft_posts.c.raw_id == raw_messages.c.id))
+            .where(draft_posts.c.id == draft_id)
+        ).fetchone()
         current = dict(draft.meta_json or {}) if draft else {}
         current.update(updates)
-        connection.execute(
-            update(draft_posts).where(draft_posts.c.id == draft_id).values(meta_json=current)
-        )
+        if draft:
+            connection.execute(update(raw_messages).where(raw_messages.c.id == draft.id).values(meta_json=current))
