@@ -201,7 +201,6 @@ async def ingest_once() -> None:
                     "published_count": published_count,
                 },
             )
-        finally:
             await client.disconnect()
     except ValueError as exc:
         if str(exc) != "Not a valid string":
