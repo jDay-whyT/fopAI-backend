@@ -5,8 +5,7 @@ import logging
 import requests
 
 from fastapi import FastAPI, Header, HTTPException
-from sqlalchemy import bindparam, select, text
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import select, text
 
 from shared.db import db_session
 from shared.logging import configure_logging
@@ -57,13 +56,13 @@ def pubsub_push(payload: dict, authorization: str | None = Header(default=None))
         with db_session() as connection:
             connection.execute(
                 text(
-                    "INSERT INTO draft_posts (raw_id, content, status) "
-                    "VALUES (:raw_id, :content, :status) "
+                    "INSERT INTO draft_posts (raw_id, error, status) "
+                    "VALUES (:raw_id, :error, :status) "
                     "ON CONFLICT (raw_id) DO NOTHING"
-                ).bindparams(bindparam("content", type_=JSONB)),
+                ),
                 {
                     "raw_id": raw_id,
-                    "content": {"error": str(exc)},
+                    "error": str(exc),
                     "status": "FAILED",
                 },
             )
@@ -75,26 +74,25 @@ def pubsub_push(payload: dict, authorization: str | None = Header(default=None))
         status = "SKIPPED"
         reason = summary.get("reason")
 
-    content = {
-        "title": summary.get("title"),
-        "body": summary.get("body"),
-        "image_prompt": summary.get("image_prompt"),
-        "skip": summary.get("skip"),
-        "reason": reason,
-        "model": summary.get("_model"),
-        "tokens": summary.get("_tokens"),
-    }
-
     draft_id = None
     with db_session() as connection:
         result = connection.execute(
             text(
-                "INSERT INTO draft_posts (raw_id, content, status) "
-                "VALUES (:raw_id, :content, :status) "
+                "INSERT INTO draft_posts (raw_id, title, body, image_prompt, status, reason, model, tokens) "
+                "VALUES (:raw_id, :title, :body, :image_prompt, :status, :reason, :model, :tokens) "
                 "ON CONFLICT (raw_id) DO NOTHING "
                 "RETURNING id"
-            ).bindparams(bindparam("content", type_=JSONB)),
-            {"raw_id": raw_id, "content": content, "status": status},
+            ),
+            {
+                "raw_id": raw_id,
+                "title": summary.get("title"),
+                "body": summary.get("body"),
+                "image_prompt": summary.get("image_prompt"),
+                "status": status,
+                "reason": reason,
+                "model": summary.get("_model"),
+                "tokens": summary.get("_tokens"),
+            },
         ).fetchone()
         if result:
             draft_id = result[0]
