@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     tg_bot_token: str | None = Field(default=None, alias="TG_BOT_TOKEN")
     admin_chat_id: int | None = Field(default=None, alias="ADMIN_CHAT_ID")
     target_channel_id: int | None = Field(default=None, alias="TARGET_CHANNEL_ID")
+    ingest_thread_id: int | None = Field(default=None, alias="INGEST_THREAD_ID")
+    review_thread_id: int | None = Field(default=None, alias="REVIEW_THREAD_ID")
+    target_channel_username: str | None = Field(default=None, alias="TARGET_CHANNEL_USERNAME")
 
     pubsub_topic: str = Field(default="tg-raw-ingested", alias="PUBSUB_TOPIC")
     pubsub_verification_audience: str | None = Field(default=None, alias="PUBSUB_VERIFICATION_AUDIENCE")
