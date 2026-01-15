@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from google.auth.transport import requests as google_requests
@@ -25,15 +26,21 @@ def verify_pubsub_jwt(authorization_header: str | None) -> None:
         raise HTTPException(status_code=401, detail="Invalid token") from exc
 
 
-def parse_pubsub_message(payload: dict[str, Any]) -> dict[str, Any]:
-    if "message" not in payload:
-        raise ValueError("Missing message in payload")
-    message = payload["message"]
+def parse_pubsub_message(payload: dict[str, Any]) -> dict[str, Any] | None:
+    logger = logging.getLogger(__name__)
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if not isinstance(message, dict):
+        logger.warning("Pub/Sub message missing 'message' field")
+        return None
     data = message.get("data")
     if not data:
-        raise ValueError("Missing data in message")
+        logger.warning("Pub/Sub message missing data")
+        return None
     import base64
     import json
 
     decoded = base64.b64decode(data).decode("utf-8")
+    if decoded == "":
+        logger.warning("Pub/Sub message data decoded to empty string")
+        return None
     return json.loads(decoded)
