@@ -49,6 +49,9 @@ def pubsub_push(payload: dict, authorization: str | None = Header(default=None))
             logger.info("Pub/Sub push decoded message size", extra={"decoded_size": decoded_size})
     verify_pubsub_jwt(authorization)
     message = parse_pubsub_message(payload)
+    if message is None:
+        logger.warning("empty pubsub message, acked")
+        return {"status": "acked"}
     raw_id = message.get("raw_id")
     if not raw_id:
         raise HTTPException(status_code=400, detail="raw_id missing")
