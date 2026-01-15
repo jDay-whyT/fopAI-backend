@@ -390,12 +390,18 @@ def _parse_callback_data(data: str) -> tuple[int, str] | None:
 
 def _update_draft_meta(draft_id: int, updates: dict[str, Any]) -> None:
     with db_session() as connection:
-        draft = connection.execute(
-            select(raw_messages.c.id, raw_messages.c.meta_json)
-            .select_from(draft_posts.join(raw_messages, draft_posts.c.raw_id == raw_messages.c.id))
-            .where(draft_posts.c.id == draft_id)
-        ).fetchone()
-        current = dict(draft.meta_json or {}) if draft else {}
+        raw_id = connection.execute(
+            select(draft_posts.c.raw_id).where(draft_posts.c.id == draft_id)
+        ).scalar_one_or_none()
+        if not raw_id:
+            logger.warning("draft_raw_id_missing", extra={"draft_id": draft_id})
+            return
+        meta_json = connection.execute(
+            select(raw_messages.c.meta_json).where(raw_messages.c.id == raw_id)
+        ).scalar_one_or_none()
+        if meta_json is None:
+            logger.warning("raw_message_missing", extra={"draft_id": draft_id, "raw_id": raw_id})
+            return
+        current = dict(meta_json or {})
         current.update(updates)
-        if draft:
-            connection.execute(update(raw_messages).where(raw_messages.c.id == draft.id).values(meta_json=current))
+        connection.execute(update(raw_messages).where(raw_messages.c.id == raw_id).values(meta_json=current))
