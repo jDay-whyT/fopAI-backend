@@ -28,7 +28,7 @@ def main() -> int:
         endpoint = "setWebhook"
         response = requests.post(
             f"https://api.telegram.org/bot{token}/{endpoint}",
-            data={"url": webhook_url, "secret_token": token},
+            data={"url": webhook_url, "allowed_updates": ["message", "callback_query"]},
             timeout=30,
         )
     else:
