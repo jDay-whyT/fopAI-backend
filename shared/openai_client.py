@@ -42,7 +42,19 @@ class OpenAIEditor:
             temperature=0.2,
         )
         content = response.choices[0].message.content or "{}"
-        parsed = json.loads(content)
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            logger.warning(
+                "Failed to parse OpenAI response JSON. Returning fallback. Content: %s",
+                content[:500],
+            )
+            return {
+                "title": "",
+                "body": content,
+                "image_prompt": None,
+                "error": "invalid_json_from_llm",
+            }
         parsed["_model"] = response.model
         parsed["_tokens"] = response.usage.total_tokens if response.usage else None
         return parsed
