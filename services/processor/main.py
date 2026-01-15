@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import logging
 
 import requests
@@ -31,6 +32,21 @@ def healthz() -> dict[str, str]:
 
 @app.post("/pubsub/push")
 def pubsub_push(payload: dict, authorization: str | None = Header(default=None)) -> dict[str, str]:
+    logger.info("Pub/Sub push received")
+    message = payload.get("message") if isinstance(payload, dict) else None
+    has_message = isinstance(message, dict)
+    has_data = has_message and "data" in message and message.get("data") is not None
+    logger.info(
+        "Pub/Sub push payload presence",
+        extra={"has_message": has_message, "has_message_data": has_data},
+    )
+    if has_data:
+        try:
+            decoded_size = len(base64.b64decode(message.get("data")))
+        except Exception:
+            decoded_size = None
+        if decoded_size is not None:
+            logger.info("Pub/Sub push decoded message size", extra={"decoded_size": decoded_size})
     verify_pubsub_jwt(authorization)
     message = parse_pubsub_message(payload)
     raw_id = message.get("raw_id")
