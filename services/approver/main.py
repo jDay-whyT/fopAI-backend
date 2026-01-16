@@ -5,6 +5,7 @@ import logging
 from typing import Any
 from fastapi import FastAPI, Header, HTTPException, Request
 from sqlalchemy import insert, select, update
+from telegram.error import TelegramError
 
 from shared.db import db_session
 from shared.logging import configure_logging
@@ -133,17 +134,30 @@ def _send_review_message(draft: Any) -> int | None:
             ]
         ]
     }
+
+try:
     response = bot.send_message(
         settings.admin_chat_id,
         text,
         reply_markup=keyboard,
         message_thread_id=settings.review_thread_id,
     )
-    message_id = response.get("result", {}).get("message_id")
-    if message_id:
-        _update_draft_meta(draft.id, {"review_message_id": message_id})
-    return message_id
+except TelegramError as e:
+    logger.exception(
+        "telegram send_message failed",
+        extra={
+            "chat_id": settings.admin_chat_id,
+            "thread_id": settings.review_thread_id,
+            "draft_id": draft.id,
+        },
+    )
+    return None
 
+message_id = response.get("result", {}).get("message_id")
+if message_id:
+    _update_draft_meta(draft.id, {"review_message_id": message_id})
+
+return message_id
 
 def _format_draft_text(draft: Any) -> str:
     title = html.escape(draft.title or "(no title)")
