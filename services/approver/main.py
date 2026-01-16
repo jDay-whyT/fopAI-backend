@@ -3,9 +3,9 @@ from __future__ import annotations
 import html
 import logging
 from typing import Any
+
 from fastapi import FastAPI, Header, HTTPException, Request
 from sqlalchemy import insert, select, update
-from telegram.error import TelegramError
 
 from shared.db import db_session
 from shared.logging import configure_logging
@@ -41,6 +41,11 @@ async def notify(payload: dict) -> dict[str, str]:
             raise HTTPException(status_code=404, detail="draft not found")
         if draft.status != "PENDING":
             return {"status": "ignored"}
+        raw_message = connection.execute(
+            select(raw_messages).where(raw_messages.c.id == draft.raw_id)
+        ).fetchone()
+        if not raw_message:
+            logger.warning("draft_raw_message_missing", extra={"draft_id": draft_id, "raw_id": draft.raw_id})
     try:
         _send_ingest_message(draft)
     except Exception as exc:  # noqa: BLE001 - do not fail notify on Telegram errors
@@ -107,12 +112,24 @@ def _send_ingest_message(draft: Any) -> None:
             ]
         ]
     }
-    response = bot.send_message(
-        settings.admin_chat_id,
-        text,
-        reply_markup=keyboard,
-        message_thread_id=settings.ingest_thread_id,
-    )
+    try:
+        response = bot.send_message(
+            settings.admin_chat_id,
+            text,
+            reply_markup=keyboard,
+            message_thread_id=settings.ingest_thread_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - log and continue
+        logger.warning(
+            "telegram_send_failed",
+            extra={
+                "chat_id": settings.admin_chat_id,
+                "thread_id": settings.ingest_thread_id,
+                "draft_id": draft.id,
+                "error": str(exc),
+            },
+        )
+        return
     message_id = response.get("result", {}).get("message_id")
     if message_id:
         _update_draft_meta(draft.id, {"ingest_message_id": message_id})
@@ -134,30 +151,31 @@ def _send_review_message(draft: Any) -> int | None:
             ]
         ]
     }
+    try:
+        response = bot.send_message(
+            settings.admin_chat_id,
+            text,
+            reply_markup=keyboard,
+            message_thread_id=settings.review_thread_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - log and continue
+        logger.warning(
+            "telegram_send_failed",
+            extra={
+                "chat_id": settings.admin_chat_id,
+                "thread_id": settings.review_thread_id,
+                "draft_id": draft.id,
+                "error": str(exc),
+            },
+        )
+        return None
 
-try:
-    response = bot.send_message(
-        settings.admin_chat_id,
-        text,
-        reply_markup=keyboard,
-        message_thread_id=settings.review_thread_id,
-    )
-except TelegramError as e:
-    logger.exception(
-        "telegram send_message failed",
-        extra={
-            "chat_id": settings.admin_chat_id,
-            "thread_id": settings.review_thread_id,
-            "draft_id": draft.id,
-        },
-    )
-    return None
+    message_id = response.get("result", {}).get("message_id")
+    if message_id:
+        _update_draft_meta(draft.id, {"review_message_id": message_id})
 
-message_id = response.get("result", {}).get("message_id")
-if message_id:
-    _update_draft_meta(draft.id, {"review_message_id": message_id})
+    return message_id
 
-return message_id
 
 def _format_draft_text(draft: Any) -> str:
     title = html.escape(draft.title or "(no title)")
@@ -408,12 +426,14 @@ def _update_draft_meta(draft_id: int, updates: dict[str, Any]) -> None:
         if not raw_id:
             logger.warning("draft_raw_id_missing", extra={"draft_id": draft_id})
             return
-        meta_json = connection.execute(
-            select(raw_messages.c.meta_json).where(raw_messages.c.id == raw_id)
-        ).scalar_one_or_none()
-        if meta_json is None:
+        raw_row = connection.execute(
+            select(raw_messages.c.id, raw_messages.c.meta_json).where(raw_messages.c.id == raw_id)
+        ).fetchone()
+        if not raw_row:
             logger.warning("raw_message_missing", extra={"draft_id": draft_id, "raw_id": raw_id})
             return
-        current = dict(meta_json or {})
+        current = dict(raw_row.meta_json or {})
         current.update(updates)
-        connection.execute(update(raw_messages).where(raw_messages.c.id == raw_id).values(meta_json=current))
+        connection.execute(
+            update(raw_messages).where(raw_messages.c.id == raw_id).values(meta_json=current)
+        )
