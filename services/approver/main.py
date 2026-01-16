@@ -3,7 +3,11 @@ from __future__ import annotations
 import html
 import logging
 from typing import Any
-from telegram.error import TelegramError
+
+try:
+    from telegram.error import TelegramError  # type: ignore
+except Exception:
+    TelegramError = Exception  # fallback
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from sqlalchemy import insert, select, update
