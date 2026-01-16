@@ -88,6 +88,27 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
     else:
         update_type = "other"
 
+    message_payload: dict[str, Any] | None = None
+    if update_type == "message" and isinstance(update.get("message"), dict):
+        message_payload = update.get("message")
+    elif update_type == "callback_query" and isinstance(update.get("callback_query"), dict):
+        callback_message = update["callback_query"].get("message")
+        if isinstance(callback_message, dict):
+            message_payload = callback_message
+
+    if isinstance(message_payload, dict):
+        chat_payload = message_payload.get("chat")
+        chat_data = chat_payload if isinstance(chat_payload, dict) else {}
+        logger.info(
+            "telegram_update_message_thread",
+            extra={
+                "chat_id": chat_data.get("id"),
+                "message_id": message_payload.get("message_id"),
+                "message_thread_id": message_payload.get("message_thread_id"),
+                "is_forum": chat_data.get("is_forum", False),
+            },
+        )
+
     logger.info("telegram_webhook_update", extra={"update_id": update_id, "update_type": update_type})
 
     try:
