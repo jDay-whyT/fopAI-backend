@@ -40,7 +40,6 @@ draft_posts = Table(
     Column("error", Text, nullable=True),
     Column("model", String, nullable=True),
     Column("tokens", Integer, nullable=True),
-    Column("meta_json", JSONB, nullable=True),
     Column("created_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
     Column("updated_at", DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False),
 )
