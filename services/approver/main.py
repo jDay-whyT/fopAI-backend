@@ -24,6 +24,7 @@ logger = logging.getLogger("approver")
 app = FastAPI()
 bot = TelegramBot()
 log_webhook_debug = os.getenv("TELEGRAM_WEBHOOK_LOG_LEVEL", "INFO").upper() == "DEBUG"
+ALLOWED_META_JSON_KEYS = {"ingest_message_id", "review_message_id", "channel_message_id"}
 
 
 def summarize_update(update: dict) -> dict[str, Any]:
@@ -488,6 +489,9 @@ def _parse_callback_data(data: str) -> tuple[int, str] | None:
 
 
 def _update_draft_meta(draft_id: int, updates: dict[str, Any]) -> None:
+    allowed_updates = {key: value for key, value in updates.items() if key in ALLOWED_META_JSON_KEYS}
+    if not allowed_updates:
+        return
     with db_session() as connection:
         raw_id = connection.execute(
             select(draft_posts.c.raw_id).where(draft_posts.c.id == draft_id)
@@ -502,7 +506,7 @@ def _update_draft_meta(draft_id: int, updates: dict[str, Any]) -> None:
             logger.warning("raw_message_missing", extra={"draft_id": draft_id, "raw_id": raw_id})
             return
         current = dict(raw_row.meta_json or {})
-        current.update(updates)
+        current.update(allowed_updates)
         connection.execute(
             update(raw_messages).where(raw_messages.c.id == raw_id).values(meta_json=current)
         )

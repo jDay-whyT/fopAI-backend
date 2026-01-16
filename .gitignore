@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+body.json
+wh.json
+tools/*.json
+DB_PASSWORD.txt
+OPENAI_API_KEY.txt
+TELEGRAM_API_HASH.txt
+TELEGRAM_API_ID.txt
+TELETHON_STRING_SESSION.txt
+TG_BOT_TOKEN.txt
