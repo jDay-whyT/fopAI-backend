@@ -97,7 +97,6 @@ def _send_ingest_message(draft: Any) -> None:
         return
     if settings.ingest_thread_id is None:
         logger.info("ingest_thread_id_missing")
-        return
     text = _format_draft_text(draft)
     keyboard = {
         "inline_keyboard": [
@@ -124,7 +123,6 @@ def _send_review_message(draft: Any) -> int | None:
         return None
     if settings.review_thread_id is None:
         logger.info("review_thread_id_missing")
-        return None
     text = _format_draft_text(draft)
     keyboard = {
         "inline_keyboard": [
