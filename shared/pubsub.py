@@ -26,21 +26,46 @@ def verify_pubsub_jwt(authorization_header: str | None) -> None:
         raise HTTPException(status_code=401, detail="Invalid token") from exc
 
 
-def parse_pubsub_message(payload: dict[str, Any]) -> dict[str, Any] | None:
+def parse_pubsub_message(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
     logger = logging.getLogger(__name__)
-    message = payload.get("message") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        logger.warning("pubsub_payload_invalid", extra={"reason": "payload_not_dict"})
+        return None, "payload_not_dict"
+
+    message = payload.get("message")
     if not isinstance(message, dict):
-        logger.warning("Pub/Sub message missing 'message' field")
-        return None
+        logger.warning("pubsub_payload_invalid", extra={"reason": "message_missing"})
+        return None, "message_missing"
+
     data = message.get("data")
-    if not data:
-        logger.warning("Pub/Sub message missing data")
-        return None
+    if data is None:
+        logger.warning("pubsub_payload_invalid", extra={"reason": "data_missing"})
+        return None, "data_missing"
+    if data == "":
+        logger.warning("pubsub_payload_invalid", extra={"reason": "data_empty"})
+        return None, "data_empty"
+
     import base64
     import json
 
-    decoded = base64.b64decode(data).decode("utf-8")
+    try:
+        decoded = base64.b64decode(data).decode("utf-8")
+    except Exception as exc:
+        logger.warning("pubsub_payload_invalid", extra={"reason": "data_decode_failed", "error": str(exc)})
+        return None, "data_decode_failed"
+
     if decoded == "":
-        logger.warning("Pub/Sub message data decoded to empty string")
-        return None
-    return json.loads(decoded)
+        logger.warning("pubsub_payload_invalid", extra={"reason": "decoded_empty"})
+        return None, "decoded_empty"
+
+    try:
+        parsed = json.loads(decoded)
+    except json.JSONDecodeError as exc:
+        logger.warning("pubsub_payload_invalid", extra={"reason": "json_invalid", "error": str(exc)})
+        return None, "json_invalid"
+
+    if not isinstance(parsed, dict):
+        logger.warning("pubsub_payload_invalid", extra={"reason": "json_not_object"})
+        return None, "json_not_object"
+
+    return parsed, None
