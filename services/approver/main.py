@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import logging
 from typing import Any
+from telegram.error import TelegramError
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from sqlalchemy import insert, select, update
