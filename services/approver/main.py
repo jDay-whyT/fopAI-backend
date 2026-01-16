@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import logging
+import os
 from typing import Any
 
 try:
@@ -22,6 +23,34 @@ from shared.telegram import TelegramBot
 logger = logging.getLogger("approver")
 app = FastAPI()
 bot = TelegramBot()
+log_webhook_debug = os.getenv("TELEGRAM_WEBHOOK_LOG_LEVEL", "INFO").upper() == "DEBUG"
+
+
+def summarize_update(update: dict) -> dict[str, Any]:
+    update_id = update.get("update_id")
+    if "callback_query" in update:
+        kind = "callback_query"
+        payload = update.get("callback_query") if isinstance(update.get("callback_query"), dict) else {}
+        message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+        from_user = payload.get("from") if isinstance(payload.get("from"), dict) else {}
+    elif "message" in update:
+        kind = "message"
+        message = update.get("message") if isinstance(update.get("message"), dict) else {}
+        from_user = message.get("from") if isinstance(message.get("from"), dict) else {}
+    else:
+        kind = "other"
+        message = {}
+        from_user = {}
+
+    chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    return {
+        "update_id": update_id,
+        "kind": kind,
+        "chat_id": chat.get("id"),
+        "message_id": message.get("message_id"),
+        "message_thread_id": message.get("message_thread_id"),
+        "from_user_id": from_user.get("id"),
+    }
 
 
 @app.on_event("startup")
@@ -44,6 +73,7 @@ async def notify(payload: dict) -> dict[str, str]:
         draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
         if not draft:
             raise HTTPException(status_code=404, detail="draft not found")
+        logger.info("internal_notify_received", extra={"draft_id": draft_id, "status": draft.status})
         if draft.status != "PENDING":
             return {"status": "ignored"}
         raw_message = connection.execute(
@@ -80,36 +110,11 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
         logger.warning("telegram_webhook_unexpected_payload")
         return {"status": "ignored"}
 
-    update_id = update.get("update_id")
-    if "callback_query" in update:
-        update_type = "callback_query"
-    elif "message" in update:
-        update_type = "message"
-    else:
-        update_type = "other"
+    summary = summarize_update(update)
+    update_type = summary["kind"]
 
-    message_payload: dict[str, Any] | None = None
-    if update_type == "message" and isinstance(update.get("message"), dict):
-        message_payload = update.get("message")
-    elif update_type == "callback_query" and isinstance(update.get("callback_query"), dict):
-        callback_message = update["callback_query"].get("message")
-        if isinstance(callback_message, dict):
-            message_payload = callback_message
-
-    if isinstance(message_payload, dict):
-        chat_payload = message_payload.get("chat")
-        chat_data = chat_payload if isinstance(chat_payload, dict) else {}
-        logger.info(
-            "telegram_update_message_thread",
-            extra={
-                "chat_id": chat_data.get("id"),
-                "message_id": message_payload.get("message_id"),
-                "message_thread_id": message_payload.get("message_thread_id"),
-                "is_forum": chat_data.get("is_forum", False),
-            },
-        )
-
-    logger.info("telegram_webhook_update", extra={"update_id": update_id, "update_type": update_type})
+    if log_webhook_debug:
+        logger.debug("telegram_webhook_update", extra=summary)
 
     try:
         if update_type == "callback_query":
@@ -117,7 +122,11 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
         if update_type == "message":
             return _handle_message(update["message"])
     except Exception as exc:  # noqa: BLE001 - avoid webhook errors to Telegram
-        logger.warning("telegram_webhook_handler_error", extra={"error": str(exc), "update_type": update_type})
+        logger.error(
+            "telegram_webhook_handler_error",
+            extra={"error": str(exc), "update_type": update_type},
+            exc_info=True,
+        )
         return {"status": "error"}
 
     return {"status": "ignored"}
@@ -158,6 +167,16 @@ def _send_ingest_message(draft: Any) -> None:
         return
     message_id = response.get("result", {}).get("message_id")
     if message_id:
+        logger.info(
+            "telegram_ingest_message_sent",
+            extra={
+                "chat_id": settings.admin_chat_id,
+                "thread_id": settings.ingest_thread_id,
+                "telegram_message_id": message_id,
+                "draft_id": draft.id,
+                "raw_id": draft.raw_id,
+            },
+        )
         _update_draft_meta(draft.id, {"ingest_message_id": message_id})
 
 
@@ -198,6 +217,16 @@ def _send_review_message(draft: Any) -> int | None:
 
     message_id = response.get("result", {}).get("message_id")
     if message_id:
+        logger.info(
+            "telegram_review_message_sent",
+            extra={
+                "chat_id": settings.admin_chat_id,
+                "thread_id": settings.review_thread_id,
+                "telegram_message_id": message_id,
+                "draft_id": draft.id,
+                "raw_id": draft.raw_id,
+            },
+        )
         _update_draft_meta(draft.id, {"review_message_id": message_id})
 
     return message_id
@@ -227,18 +256,22 @@ def _handle_callback(callback: dict) -> dict[str, str]:
     message_thread_id = message.get("message_thread_id")
 
     if action == "take":
+        logger.info("telegram_callback_action", extra={"action": "TAKE", "draft_id": draft_id})
         _move_to_review(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
         bot.answer_callback(callback_id, "Moved to review")
         return {"status": "taken"}
     if action == "skip":
+        logger.info("telegram_callback_action", extra={"action": "SKIP", "draft_id": draft_id})
         _skip_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
         bot.answer_callback(callback_id, "Skipped")
         return {"status": "skipped"}
     if action == "post":
+        logger.info("telegram_callback_action", extra={"action": "POST", "draft_id": draft_id})
         _post_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
         bot.answer_callback(callback_id, "Posted")
         return {"status": "posted"}
     if action == "edit":
+        logger.info("telegram_callback_action", extra={"action": "EDIT", "draft_id": draft_id})
         _edit_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
         bot.answer_callback(callback_id, "Edited")
         return {"status": "edited"}
@@ -343,6 +376,16 @@ def _post_draft(
         caption = _format_draft_text(draft)
         response = bot.send_message(settings.target_channel_username, caption)
         published_message_id = response.get("result", {}).get("message_id")
+        if published_message_id:
+            logger.info(
+                "telegram_publish_success",
+                extra={
+                    "channel_username": settings.target_channel_username,
+                    "channel_id": settings.target_channel_id,
+                    "channel_message_id": published_message_id,
+                    "draft_id": draft_id,
+                },
+            )
 
         connection.execute(
             update(draft_posts).where(draft_posts.c.id == draft_id).values(status="PUBLISHED")
