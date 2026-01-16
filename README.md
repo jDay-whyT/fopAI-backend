@@ -9,6 +9,10 @@ This repo contains a Telegram news pipeline on GCP with MTProto ingest, GPT proc
 - **Approver (Cloud Run Service)**: Telegram bot webhook for review/approve/edit/reject.
 - **PostgreSQL (Cloud SQL)**: Persistent storage.
 
+## Components & flow
+
+Ingest -> Pub/Sub -> Processor -> Approver -> Channel
+
 ## GCP fixed values
 
 - Region: `us-central1`
@@ -38,6 +42,17 @@ Create these secrets in Secret Manager (values omitted):
 - `OPENAI_API_KEY` (required for processor/approver; not needed for ingest)
 - `TG_BOT_TOKEN`
 
+Required env vars (secrets + non-secrets):
+
+- `DB_PASSWORD`
+- `OPENAI_API_KEY`
+- `TG_BOT_TOKEN`
+- `ADMIN_CHAT_ID`
+- `TARGET_CHANNEL_ID` or `TARGET_CHANNEL_USERNAME`
+- `INGEST_THREAD_ID`
+- `REVIEW_THREAD_ID`
+- `APPROVER_NOTIFY_URL`
+
 Non-secret env vars:
 
 - `DB_INSTANCE_CONNECTION_NAME` (fixed value above)
@@ -45,6 +60,9 @@ Non-secret env vars:
 - `DB_USER` (defaults to `postgres`)
 - `ADMIN_CHAT_ID` (required for review notifications)
 - `TARGET_CHANNEL_ID` (optional; defaults to admin chat)
+- `TARGET_CHANNEL_USERNAME` (optional; defaults to admin chat)
+- `INGEST_THREAD_ID` (thread to post new drafts in admin chat)
+- `REVIEW_THREAD_ID` (thread to post review messages in admin chat)
 - `PUBSUB_TOPIC` (`tg-raw-ingested`)
 - `PUBSUB_VERIFICATION_AUDIENCE` (Cloud Run service URL for processor)
 - `APPROVER_NOTIFY_URL` (approver internal notify endpoint URL)
@@ -112,6 +130,39 @@ gcloud run jobs create set-telegram-webhook \
   --set-env-vars TG_BOT_TOKEN=$TG_BOT_TOKEN,WEBHOOK_URL=$WEBHOOK_URL
 
 gcloud run jobs execute set-telegram-webhook
+```
+
+## How to find thread IDs
+
+To discover forum thread IDs in the admin chat, temporarily remove the webhook, send a message in the desired thread, then inspect `message_thread_id`:
+
+```bash
+curl -s "https://api.telegram.org/bot$TG_BOT_TOKEN/deleteWebhook"
+curl -s "https://api.telegram.org/bot$TG_BOT_TOKEN/getUpdates"
+```
+
+Use the `message_thread_id` from the update as `INGEST_THREAD_ID` or `REVIEW_THREAD_ID`, then restore the webhook:
+
+```bash
+curl -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/setWebhook" \
+  -d "url=https://APPROVER_URL/telegram/webhook" \
+  -d "secret_token=$TG_BOT_TOKEN"
+```
+
+## Smoke tests
+
+Trigger an ingest run and verify Pub/Sub delivery:
+
+```bash
+gcloud run jobs execute ingest
+gcloud pubsub topics publish tg-raw-ingested --message='{\"ok\":true}'
+```
+
+Send a direct push payload to the processor using a local `body.json`:
+
+```bash
+echo '{\"message\":{\"data\":\"'$(printf '{\"ok\":true}' | base64 -w 0)'\",\"messageId\":\"1\"},\"subscription\":\"test\"}' > body.json
+curl -X POST https://PROCESSOR_URL/pubsub/push -H \"Content-Type: application/json\" --data @body.json
 ```
 
 ## Cloud Scheduler
