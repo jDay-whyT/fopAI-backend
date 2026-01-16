@@ -70,8 +70,8 @@ def _update_offset(chat_id: int, last_message_id: int) -> None:
         )
 
 
-def _insert_raw_messages(messages: Iterable[dict]) -> list[int]:
-    inserted_ids: list[int] = []
+def _insert_raw_messages(messages: Iterable[dict]) -> list[dict[str, int]]:
+    inserted_payloads: list[dict[str, int]] = []
     with db_session() as connection:
         for message in messages:
             stmt = (
@@ -82,8 +82,14 @@ def _insert_raw_messages(messages: Iterable[dict]) -> list[int]:
             )
             result = connection.execute(stmt).fetchone()
             if result:
-                inserted_ids.append(result[0])
-    return inserted_ids
+                inserted_payloads.append(
+                    {
+                        "raw_id": result[0],
+                        "chat_id": message["chat_id"],
+                        "message_id": message["message_id"],
+                    }
+                )
+    return inserted_payloads
 
 
 async def ingest_once() -> None:
@@ -145,28 +151,27 @@ async def ingest_once() -> None:
                         )
 
                     fetched_count += len(new_messages)
-                    inserted_ids = _insert_raw_messages(new_messages)
-                    inserted_count += len(inserted_ids)
+                    inserted_payloads = _insert_raw_messages(new_messages)
+                    inserted_count += len(inserted_payloads)
                     if max_message_id > last_message_id:
                         _update_offset(chat_id, max_message_id)
 
-                    to_publish_count += len(inserted_ids)
-                    for raw_id in inserted_ids:
-                        payload = {"raw_id": raw_id}
+                    to_publish_count += len(inserted_payloads)
+                    for payload in inserted_payloads:
                         try:
                             future = publisher.publish(topic_path, json.dumps(payload).encode("utf-8"))
                             message_id = future.result(timeout=15)
                             published_count += 1
                             logger.info(
                                 "Published Pub/Sub message",
-                                extra={"message_id": message_id, "raw_id": raw_id, "source": source},
+                                extra={"message_id": message_id, "raw_id": payload["raw_id"], "source": source},
                             )
                         except Exception as exc:
                             logger.error(
                                 "Failed to publish Pub/Sub message",
                                 extra={
                                     "source": source,
-                                    "raw_id": raw_id,
+                                    "raw_id": payload["raw_id"],
                                     "error_type": type(exc).__name__,
                                     "error": str(exc),
                                 },
@@ -174,7 +179,7 @@ async def ingest_once() -> None:
 
                     logger.info(
                         "Ingested messages",
-                        extra={"source": source, "inserted": len(inserted_ids), "max_message_id": max_message_id},
+                        extra={"source": source, "inserted": len(inserted_payloads), "max_message_id": max_message_id},
                     )
                 except AuthKeyDuplicatedError:
                     logger.error("Auth key duplicated. Stop ingest and create a fresh Telethon string session.")
@@ -192,6 +197,8 @@ async def ingest_once() -> None:
                     logger.exception("Failed ingest", extra={"source": source, "error": str(exc)})
                     raise SystemExit(1)
         finally:
+            if to_publish_count == 0:
+                logger.info("No new messages found; nothing to publish.")
             logger.info(
                 "Ingest totals",
                 extra={

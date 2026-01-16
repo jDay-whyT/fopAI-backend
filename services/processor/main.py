@@ -5,7 +5,7 @@ import logging
 
 import requests
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
 from sqlalchemy import select, text
 
 from shared.db import db_session
@@ -48,12 +48,20 @@ def pubsub_push(payload: dict, authorization: str | None = Header(default=None))
         if decoded_size is not None:
             logger.info("Pub/Sub push decoded message size", extra={"decoded_size": decoded_size})
     verify_pubsub_jwt(authorization)
-    message = parse_pubsub_message(payload)
+    message, parse_error = parse_pubsub_message(payload)
+    if parse_error:
+        status_code = 400
+        if parse_error in {"data_missing", "data_empty", "decoded_empty"}:
+            status_code = 204
+        logger.warning("pubsub_message_rejected", extra={"reason": parse_error, "status_code": status_code})
+        return Response(status_code=status_code)
     if message is None:
-        logger.warning("empty pubsub message, acked")
-        return {"status": "acked"}
+        logger.warning("pubsub_message_empty")
+        return Response(status_code=204)
+
     raw_id = message.get("raw_id")
     if not raw_id:
+        logger.warning("pubsub_message_missing_raw_id")
         raise HTTPException(status_code=400, detail="raw_id missing")
 
     with db_session() as connection:
