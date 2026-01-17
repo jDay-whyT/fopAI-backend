@@ -134,54 +134,6 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
     return {"status": "ignored"}
 
 
-def _send_ingest_message(draft: Any) -> None:
-    if not settings.admin_chat_id:
-        logger.info("admin_chat_id_missing")
-        return
-    if settings.ingest_thread_id is None:
-        logger.info("ingest_thread_id_missing")
-    text = _format_draft_text(draft)
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "RED", "callback_data": _build_callback_data(draft.id, "red_ingest")},
-                {"text": "SKIP", "callback_data": _build_callback_data(draft.id, "skip")},
-            ]
-        ]
-    }
-    try:
-        response = bot.send_message(
-            settings.admin_chat_id,
-            text,
-            reply_markup=keyboard,
-            message_thread_id=settings.ingest_thread_id,
-        )
-    except Exception as exc:  # noqa: BLE001 - log and continue
-        logger.warning(
-            "telegram_send_failed",
-            extra={
-                "chat_id": settings.admin_chat_id,
-                "thread_id": settings.ingest_thread_id,
-                "draft_id": draft.id,
-                "error": str(exc),
-            },
-        )
-        return
-    message_id = response.get("result", {}).get("message_id")
-    if message_id:
-        logger.info(
-            "telegram_ingest_message_sent",
-            extra={
-                "chat_id": settings.admin_chat_id,
-                "thread_id": settings.ingest_thread_id,
-                "telegram_message_id": message_id,
-                "draft_id": draft.id,
-                "raw_id": draft.raw_id,
-            },
-        )
-        _update_draft_meta(draft.id, {"ingest_message_id": message_id})
-
-
 def _send_review_message(draft: Any) -> int | None:
     if not settings.admin_chat_id:
         logger.info("admin_chat_id_missing")
@@ -304,10 +256,8 @@ def _handle_callback(callback: dict) -> dict[str, str]:
     message_thread_id = message.get("message_thread_id")
 
     if action == "take":
-        logger.info("telegram_callback_action", extra={"action": "TAKE", "draft_id": draft_id})
-        _move_to_review(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
-        bot.answer_callback(callback_id, "Moved to review")
-        return {"status": "taken"}
+        bot.answer_callback(callback_id, "Unknown action")
+        return {"status": "ignored"}
     if action == "red_ingest":
         logger.info("telegram_callback_action", extra={"action": "RED_INGEST", "draft_id": draft_id})
         _red_ingest(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
@@ -319,15 +269,11 @@ def _handle_callback(callback: dict) -> dict[str, str]:
         bot.answer_callback(callback_id, "Skipped")
         return {"status": "skipped"}
     if action == "skip":
-        logger.info("telegram_callback_action", extra={"action": "SKIP", "draft_id": draft_id})
-        _skip_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
-        bot.answer_callback(callback_id, "Skipped")
-        return {"status": "skipped"}
+        bot.answer_callback(callback_id, "Unknown action")
+        return {"status": "ignored"}
     if action == "post":
-        logger.info("telegram_callback_action", extra={"action": "POST", "draft_id": draft_id})
-        _post_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
-        bot.answer_callback(callback_id, "Posted")
-        return {"status": "posted"}
+        bot.answer_callback(callback_id, "Unknown action")
+        return {"status": "ignored"}
     if action == "post_review":
         logger.info("telegram_callback_action", extra={"action": "POST_REVIEW", "draft_id": draft_id})
         _post_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
@@ -393,26 +339,6 @@ def _parse_title_body(text: str) -> tuple[str, str]:
         title = lines[0] if lines else ""
         body = lines[1] if len(lines) > 1 else ""
     return title.strip(), body.strip()
-
-
-def _move_to_review(
-    draft_id: int,
-    message_id: int | None,
-    chat_id: int | None,
-    message_thread_id: int | None,
-) -> None:
-    with db_session() as connection:
-        draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
-        if not draft:
-            raise HTTPException(status_code=404, detail="draft not found")
-        connection.execute(
-            update(draft_posts).where(draft_posts.c.id == draft_id).values(status="REVIEW")
-        )
-    review_message_id = _send_review_message(draft)
-    if review_message_id:
-        _update_draft_meta(draft_id, {"review_message_id": review_message_id})
-    if chat_id and message_id:
-        bot.delete_message(chat_id, message_id, message_thread_id=message_thread_id)
 
 
 def _red_ingest(
@@ -600,6 +526,7 @@ def _edit_draft(
                 image_prompt=summary.get("image_prompt"),
                 model=summary.get("_model"),
                 tokens=summary.get("_tokens"),
+                status="REVIEW",
             )
         )
         draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
