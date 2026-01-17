@@ -75,25 +75,19 @@ async def notify(payload: dict) -> dict[str, str]:
         if not draft:
             raise HTTPException(status_code=404, detail="draft not found")
         logger.info("internal_notify_received", extra={"draft_id": draft_id, "status": draft.status})
-        if draft.status == "INGEST":
-            raw_message = connection.execute(
-                select(raw_messages).where(raw_messages.c.id == draft.raw_id)
-            ).fetchone()
-            if not raw_message:
-                logger.warning("draft_raw_message_missing", extra={"draft_id": draft_id, "raw_id": draft.raw_id})
-            else:
-                try:
-                    _send_ingest_raw_message(draft, raw_message)
-                except Exception as exc:  # noqa: BLE001 - do not fail notify on Telegram errors
-                    logger.warning("notify_send_failed", extra={"draft_id": draft_id, "error": str(exc)})
-                return {"status": "sent"}
-        if draft.status != "PENDING":
+        if draft.status != "INGEST":
             return {"status": "ignored"}
-    try:
-        _send_ingest_message(draft)
-    except Exception as exc:  # noqa: BLE001 - do not fail notify on Telegram errors
-        logger.warning("notify_send_failed", extra={"draft_id": draft_id, "error": str(exc)})
-        return {"status": "sent"}
+        raw_message = connection.execute(
+            select(raw_messages).where(raw_messages.c.id == draft.raw_id)
+        ).fetchone()
+        if not raw_message:
+            logger.warning("draft_raw_message_missing", extra={"draft_id": draft_id, "raw_id": draft.raw_id})
+        else:
+            try:
+                _send_ingest_raw_message(draft, raw_message)
+            except Exception as exc:  # noqa: BLE001 - do not fail notify on Telegram errors
+                logger.warning("notify_send_failed", extra={"draft_id": draft_id, "error": str(exc)})
+            return {"status": "sent"}
     return {"status": "sent"}
 
 
@@ -150,7 +144,7 @@ def _send_ingest_message(draft: Any) -> None:
     keyboard = {
         "inline_keyboard": [
             [
-                {"text": "TAKE", "callback_data": _build_callback_data(draft.id, "take")},
+                {"text": "RED", "callback_data": _build_callback_data(draft.id, "red_ingest")},
                 {"text": "SKIP", "callback_data": _build_callback_data(draft.id, "skip")},
             ]
         ]
@@ -383,7 +377,7 @@ def _handle_message(message: dict) -> dict[str, str]:
         connection.execute(
             update(draft_posts)
             .where(draft_posts.c.id == draft_id)
-            .values(title=title, body=body, status="PENDING")
+            .values(title=title, body=body, status="REVIEW")
         )
         draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
     if draft:
@@ -412,7 +406,7 @@ def _move_to_review(
         if not draft:
             raise HTTPException(status_code=404, detail="draft not found")
         connection.execute(
-            update(draft_posts).where(draft_posts.c.id == draft_id).values(status="IN_REVIEW")
+            update(draft_posts).where(draft_posts.c.id == draft_id).values(status="REVIEW")
         )
     review_message_id = _send_review_message(draft)
     if review_message_id:
@@ -439,7 +433,15 @@ def _red_ingest(
         ).fetchone()
         if not raw_message:
             raise HTTPException(status_code=404, detail="raw message not found")
-    summary = editor.summarize(raw_message.text or "")
+    try:
+        summary = editor.summarize(raw_message.text or "")
+    except Exception as exc:  # noqa: BLE001 - OpenAI errors should mark failed
+        with db_session() as connection:
+            connection.execute(
+                update(draft_posts).where(draft_posts.c.id == draft_id).values(status="FAILED")
+            )
+        logger.warning("openai_summarize_failed", extra={"draft_id": draft_id, "error": str(exc)})
+        raise HTTPException(status_code=502, detail="OpenAI summarization failed") from exc
     with db_session() as connection:
         connection.execute(
             update(draft_posts)
@@ -450,7 +452,7 @@ def _red_ingest(
                 image_prompt=summary.get("image_prompt"),
                 model=summary.get("_model"),
                 tokens=summary.get("_tokens"),
-                status="IN_REVIEW",
+                status="REVIEW",
             )
         )
         draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
@@ -488,7 +490,7 @@ def _post_draft(
             raise HTTPException(status_code=404, detail="draft not found")
         if draft.status == "PUBLISHED":
             return
-        if draft.status not in {"IN_REVIEW", "PENDING"}:
+        if draft.status not in {"REVIEW"}:
             raise HTTPException(status_code=400, detail="draft not publishable")
 
         if not settings.target_channel_username:
@@ -536,7 +538,15 @@ def _red_review(
         if not draft:
             raise HTTPException(status_code=404, detail="draft not found")
     input_text = _format_edit_input(draft)
-    summary = editor.summarize(input_text)
+    try:
+        summary = editor.summarize(input_text)
+    except Exception as exc:  # noqa: BLE001 - OpenAI errors should mark failed
+        with db_session() as connection:
+            connection.execute(
+                update(draft_posts).where(draft_posts.c.id == draft_id).values(status="FAILED")
+            )
+        logger.warning("openai_summarize_failed", extra={"draft_id": draft_id, "error": str(exc)})
+        raise HTTPException(status_code=502, detail="OpenAI summarization failed") from exc
     with db_session() as connection:
         connection.execute(
             update(draft_posts)
@@ -547,7 +557,7 @@ def _red_review(
                 image_prompt=summary.get("image_prompt"),
                 model=summary.get("_model"),
                 tokens=summary.get("_tokens"),
-                status="IN_REVIEW",
+                status="REVIEW",
             )
         )
         draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
@@ -571,7 +581,15 @@ def _edit_draft(
             raise HTTPException(status_code=404, detail="draft not found")
 
     input_text = _format_edit_input(draft)
-    summary = editor.summarize(input_text)
+    try:
+        summary = editor.summarize(input_text)
+    except Exception as exc:  # noqa: BLE001 - OpenAI errors should mark failed
+        with db_session() as connection:
+            connection.execute(
+                update(draft_posts).where(draft_posts.c.id == draft_id).values(status="FAILED")
+            )
+        logger.warning("openai_summarize_failed", extra={"draft_id": draft_id, "error": str(exc)})
+        raise HTTPException(status_code=502, detail="OpenAI summarization failed") from exc
     with db_session() as connection:
         connection.execute(
             update(draft_posts)
