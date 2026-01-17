@@ -75,13 +75,20 @@ async def notify(payload: dict) -> dict[str, str]:
         if not draft:
             raise HTTPException(status_code=404, detail="draft not found")
         logger.info("internal_notify_received", extra={"draft_id": draft_id, "status": draft.status})
+        if draft.status == "INGEST":
+            raw_message = connection.execute(
+                select(raw_messages).where(raw_messages.c.id == draft.raw_id)
+            ).fetchone()
+            if not raw_message:
+                logger.warning("draft_raw_message_missing", extra={"draft_id": draft_id, "raw_id": draft.raw_id})
+            else:
+                try:
+                    _send_ingest_raw_message(draft, raw_message)
+                except Exception as exc:  # noqa: BLE001 - do not fail notify on Telegram errors
+                    logger.warning("notify_send_failed", extra={"draft_id": draft_id, "error": str(exc)})
+                return {"status": "sent"}
         if draft.status != "PENDING":
             return {"status": "ignored"}
-        raw_message = connection.execute(
-            select(raw_messages).where(raw_messages.c.id == draft.raw_id)
-        ).fetchone()
-        if not raw_message:
-            logger.warning("draft_raw_message_missing", extra={"draft_id": draft_id, "raw_id": draft.raw_id})
     try:
         _send_ingest_message(draft)
     except Exception as exc:  # noqa: BLE001 - do not fail notify on Telegram errors
@@ -188,15 +195,7 @@ def _send_review_message(draft: Any) -> int | None:
     if settings.review_thread_id is None:
         logger.info("review_thread_id_missing")
     text = _format_draft_text(draft)
-    keyboard = {
-        "inline_keyboard": [
-            [
-                {"text": "POST", "callback_data": _build_callback_data(draft.id, "post")},
-                {"text": "EDIT", "callback_data": _build_callback_data(draft.id, "edit")},
-                {"text": "SKIP", "callback_data": _build_callback_data(draft.id, "skip")},
-            ]
-        ]
-    }
+    keyboard = _build_review_keyboard(draft.id)
     try:
         response = bot.send_message(
             settings.admin_chat_id,
@@ -240,6 +239,60 @@ def _format_draft_text(draft: Any) -> str:
     return f"{header}\n\n<b>{title}</b>\n\n{body}".strip()
 
 
+def _format_raw_text(raw_message: Any, draft: Any) -> str:
+    header = f"Raw ingest: {draft.id}"
+    raw_text = html.escape(raw_message.text or "")
+    return f"{header}\n\n{raw_text}".strip()
+
+
+def _send_ingest_raw_message(draft: Any, raw_message: Any) -> None:
+    if not settings.admin_chat_id:
+        logger.info("admin_chat_id_missing")
+        return
+    if settings.ingest_thread_id is None:
+        logger.info("ingest_thread_id_missing")
+    text = _format_raw_text(raw_message, draft)
+    keyboard = {
+        "inline_keyboard": [
+            [
+                {"text": "RED", "callback_data": _build_callback_data(draft.id, "red_ingest")},
+                {"text": "SKIP", "callback_data": _build_callback_data(draft.id, "skip_ingest")},
+            ]
+        ]
+    }
+    try:
+        response = bot.send_message(
+            settings.admin_chat_id,
+            text,
+            reply_markup=keyboard,
+            message_thread_id=settings.ingest_thread_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - log and continue
+        logger.warning(
+            "telegram_send_failed",
+            extra={
+                "chat_id": settings.admin_chat_id,
+                "thread_id": settings.ingest_thread_id,
+                "draft_id": draft.id,
+                "error": str(exc),
+            },
+        )
+        return
+    message_id = response.get("result", {}).get("message_id")
+    if message_id:
+        logger.info(
+            "telegram_ingest_raw_message_sent",
+            extra={
+                "chat_id": settings.admin_chat_id,
+                "thread_id": settings.ingest_thread_id,
+                "telegram_message_id": message_id,
+                "draft_id": draft.id,
+                "raw_id": draft.raw_id,
+            },
+        )
+        _update_draft_meta(draft.id, {"ingest_message_id": message_id})
+
+
 def _handle_callback(callback: dict) -> dict[str, str]:
     data = callback.get("data", "")
     callback_id = callback.get("id")
@@ -261,6 +314,16 @@ def _handle_callback(callback: dict) -> dict[str, str]:
         _move_to_review(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
         bot.answer_callback(callback_id, "Moved to review")
         return {"status": "taken"}
+    if action == "red_ingest":
+        logger.info("telegram_callback_action", extra={"action": "RED_INGEST", "draft_id": draft_id})
+        _red_ingest(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
+        bot.answer_callback(callback_id, "Moved to review")
+        return {"status": "red_ingest"}
+    if action == "skip_ingest":
+        logger.info("telegram_callback_action", extra={"action": "SKIP_INGEST", "draft_id": draft_id})
+        _skip_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
+        bot.answer_callback(callback_id, "Skipped")
+        return {"status": "skipped"}
     if action == "skip":
         logger.info("telegram_callback_action", extra={"action": "SKIP", "draft_id": draft_id})
         _skip_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
@@ -271,6 +334,21 @@ def _handle_callback(callback: dict) -> dict[str, str]:
         _post_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
         bot.answer_callback(callback_id, "Posted")
         return {"status": "posted"}
+    if action == "post_review":
+        logger.info("telegram_callback_action", extra={"action": "POST_REVIEW", "draft_id": draft_id})
+        _post_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
+        bot.answer_callback(callback_id, "Posted")
+        return {"status": "posted"}
+    if action == "red_review":
+        logger.info("telegram_callback_action", extra={"action": "RED_REVIEW", "draft_id": draft_id})
+        _red_review(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
+        bot.answer_callback(callback_id, "Updated")
+        return {"status": "red_review"}
+    if action == "skip_review":
+        logger.info("telegram_callback_action", extra={"action": "SKIP_REVIEW", "draft_id": draft_id})
+        _skip_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
+        bot.answer_callback(callback_id, "Skipped")
+        return {"status": "skipped"}
     if action == "edit":
         logger.info("telegram_callback_action", extra={"action": "EDIT", "draft_id": draft_id})
         _edit_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
@@ -343,6 +421,47 @@ def _move_to_review(
         bot.delete_message(chat_id, message_id, message_thread_id=message_thread_id)
 
 
+def _red_ingest(
+    draft_id: int,
+    message_id: int | None,
+    chat_id: int | None,
+    message_thread_id: int | None,
+) -> None:
+    editor = get_editor()
+    if editor is None:
+        raise HTTPException(status_code=503, detail="OpenAI client unavailable")
+    with db_session() as connection:
+        draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
+        if not draft:
+            raise HTTPException(status_code=404, detail="draft not found")
+        raw_message = connection.execute(
+            select(raw_messages).where(raw_messages.c.id == draft.raw_id)
+        ).fetchone()
+        if not raw_message:
+            raise HTTPException(status_code=404, detail="raw message not found")
+    summary = editor.summarize(raw_message.text or "")
+    with db_session() as connection:
+        connection.execute(
+            update(draft_posts)
+            .where(draft_posts.c.id == draft_id)
+            .values(
+                title=summary.get("title"),
+                body=summary.get("body"),
+                image_prompt=summary.get("image_prompt"),
+                model=summary.get("_model"),
+                tokens=summary.get("_tokens"),
+                status="IN_REVIEW",
+            )
+        )
+        draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
+    if draft:
+        review_message_id = _send_review_message(draft)
+        if review_message_id:
+            _update_draft_meta(draft.id, {"review_message_id": review_message_id})
+    if chat_id and message_id:
+        bot.delete_message(chat_id, message_id, message_thread_id=message_thread_id)
+
+
 def _skip_draft(
     draft_id: int,
     message_id: int | None,
@@ -403,6 +522,39 @@ def _post_draft(
         bot.delete_message(chat_id, message_id, message_thread_id=message_thread_id)
 
 
+def _red_review(
+    draft_id: int,
+    message_id: int | None,
+    chat_id: int | None,
+    message_thread_id: int | None,
+) -> None:
+    editor = get_editor()
+    if editor is None:
+        raise HTTPException(status_code=503, detail="OpenAI client unavailable")
+    with db_session() as connection:
+        draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
+        if not draft:
+            raise HTTPException(status_code=404, detail="draft not found")
+    input_text = _format_edit_input(draft)
+    summary = editor.summarize(input_text)
+    with db_session() as connection:
+        connection.execute(
+            update(draft_posts)
+            .where(draft_posts.c.id == draft_id)
+            .values(
+                title=summary.get("title"),
+                body=summary.get("body"),
+                image_prompt=summary.get("image_prompt"),
+                model=summary.get("_model"),
+                tokens=summary.get("_tokens"),
+                status="IN_REVIEW",
+            )
+        )
+        draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
+    if draft:
+        _refresh_review_message(draft, chat_id=chat_id, message_id=message_id, message_thread_id=message_thread_id)
+
+
 def _edit_draft(
     draft_id: int,
     message_id: int | None,
@@ -436,16 +588,37 @@ def _edit_draft(
 
     if not draft:
         return
-    text = _format_draft_text(draft)
-    keyboard = {
+    _refresh_review_message(draft, chat_id=chat_id, message_id=message_id, message_thread_id=message_thread_id)
+
+
+def _format_edit_input(draft: Any) -> str:
+    title = (draft.title or "").strip()
+    body = (draft.body or "").strip()
+    if title and body:
+        return f"{title}\n\n{body}"
+    return title or body
+
+
+def _build_review_keyboard(draft_id: int) -> dict[str, Any]:
+    return {
         "inline_keyboard": [
             [
-                {"text": "POST", "callback_data": _build_callback_data(draft.id, "post")},
-                {"text": "EDIT", "callback_data": _build_callback_data(draft.id, "edit")},
-                {"text": "SKIP", "callback_data": _build_callback_data(draft.id, "skip")},
+                {"text": "POST", "callback_data": _build_callback_data(draft_id, "post_review")},
+                {"text": "RED", "callback_data": _build_callback_data(draft_id, "red_review")},
+                {"text": "SKIP", "callback_data": _build_callback_data(draft_id, "skip_review")},
             ]
         ]
     }
+
+
+def _refresh_review_message(
+    draft: Any,
+    chat_id: int | None,
+    message_id: int | None,
+    message_thread_id: int | None,
+) -> None:
+    text = _format_draft_text(draft)
+    keyboard = _build_review_keyboard(draft.id)
     if chat_id and message_id:
         try:
             bot.edit_message_text(
@@ -457,20 +630,10 @@ def _edit_draft(
             )
             return
         except Exception as exc:  # noqa: BLE001 - fallback to new message
-            logger.warning("telegram_edit_failed", extra={"draft_id": draft_id, "error": str(exc)})
+            logger.warning("telegram_edit_failed", extra={"draft_id": draft.id, "error": str(exc)})
     review_message_id = _send_review_message(draft)
     if review_message_id:
-        _update_draft_meta(draft_id, {"review_message_id": review_message_id})
-    if chat_id and message_id:
-        bot.delete_message(chat_id, message_id, message_thread_id=message_thread_id)
-
-
-def _format_edit_input(draft: Any) -> str:
-    title = (draft.title or "").strip()
-    body = (draft.body or "").strip()
-    if title and body:
-        return f"{title}\n\n{body}"
-    return title or body
+        _update_draft_meta(draft.id, {"review_message_id": review_message_id})
 
 
 def _build_callback_data(draft_id: int, action: str) -> str:
