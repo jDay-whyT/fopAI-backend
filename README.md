@@ -66,8 +66,37 @@ Non-secret env vars:
 - `PUBSUB_TOPIC` (`tg-raw-ingested`)
 - `PUBSUB_VERIFICATION_AUDIENCE` (Cloud Run service URL for processor)
 - `APPROVER_NOTIFY_URL` (approver internal notify endpoint URL)
+- `INGEST_SOURCES` (comma-separated Telegram source usernames or numeric IDs)
+- `INGEST_MAX_MESSAGES_PER_SOURCE` (optional; default `50`)
+- `INGEST_MAX_TOTAL_MESSAGES` (optional; default `200`)
 
 For local development, copy `.env.example` to `.env`.
+
+## Ingest sources and limits (Cloud Run Job)
+
+Configure ingest sources explicitly to avoid reading unintended channels. The job will fail fast if `INGEST_SOURCES` is empty.
+
+Set environment variables on the ingest Cloud Run Job:
+
+```bash
+gcloud run jobs update ingest \
+  --set-env-vars INGEST_SOURCES="@Minfin_com_ua,verkhovnaradaukrainy,123456789" \
+  --set-env-vars INGEST_MAX_MESSAGES_PER_SOURCE=50,INGEST_MAX_TOTAL_MESSAGES=200
+```
+
+Example configurations:
+
+- Single channel by username:
+  ```bash
+  gcloud run jobs update ingest \
+    --set-env-vars INGEST_SOURCES="@tax_gov_ua"
+  ```
+- Multiple sources with numeric IDs and tighter limits:
+  ```bash
+  gcloud run jobs update ingest \
+    --set-env-vars INGEST_SOURCES="@nbu_ua,987654321" \
+    --set-env-vars INGEST_MAX_MESSAGES_PER_SOURCE=20,INGEST_MAX_TOTAL_MESSAGES=60
+  ```
 
 ## Secrets bootstrap
 
