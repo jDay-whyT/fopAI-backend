@@ -19,8 +19,8 @@ from shared.logging import configure_logging
 from shared.models import offsets, raw_messages
 from shared.settings import settings
 
-SOURCES = ["Minfin_com_ua", "verkhovnaradaukrainy", "tax_gov_ua", "nbu_ua"]
-MAX_MESSAGES_PER_SOURCE = 100
+DEFAULT_MAX_MESSAGES_PER_SOURCE = 50
+DEFAULT_MAX_TOTAL_MESSAGES = 200
 
 logger = logging.getLogger("ingest")
 TELETHON_STRING_SESSION_PREFIX = "1"
@@ -43,6 +43,39 @@ def _validate_telethon_string_session(value: str | None) -> str:
 
 def _get_pubsub_client() -> pubsub_v1.PublisherClient:
     return pubsub_v1.PublisherClient()
+
+
+def _parse_sources(value: str | None) -> list[str]:
+    raw_items = (value or "").split(",")
+    cleaned_items = [item.strip() for item in raw_items]
+    sources: list[str] = []
+    seen = set()
+    for item in cleaned_items:
+        if not item:
+            continue
+        if item in seen:
+            continue
+        sources.append(item)
+        seen.add(item)
+    if not sources:
+        raise RuntimeError(
+            "INGEST_SOURCES is required and must list Telegram sources "
+            "(comma-separated usernames or numeric IDs)."
+        )
+    return sources
+
+
+def _get_env_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value.strip() == "":
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer.") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be greater than zero.")
+    return value
 
 
 def _topic_path(client: pubsub_v1.PublisherClient) -> str:
@@ -100,6 +133,19 @@ async def ingest_once() -> None:
     if settings.tg_bot_token or os.getenv("TG_BOT_TOKEN"):
         logger.warning("TG_BOT_TOKEN is set but will be ignored; ingest runs in user mode only.")
     telethon_string_session = _validate_telethon_string_session(settings.telethon_string_session)
+    sources = _parse_sources(os.getenv("INGEST_SOURCES"))
+    max_messages_per_source = _get_env_int(
+        "INGEST_MAX_MESSAGES_PER_SOURCE",
+        DEFAULT_MAX_MESSAGES_PER_SOURCE,
+    )
+    max_total_messages = _get_env_int(
+        "INGEST_MAX_TOTAL_MESSAGES",
+        DEFAULT_MAX_TOTAL_MESSAGES,
+    )
+    logger.info(
+        "Configured ingest sources",
+        extra={"sources": sources, "max_messages_per_source": max_messages_per_source, "max_total_messages": max_total_messages},
+    )
     logger.info("telethon mode=user")
 
     publisher = _get_pubsub_client()
@@ -121,21 +167,35 @@ async def ingest_once() -> None:
             logger.error("Fatal: Telethon session is a bot user. Ingest must run as a user session.")
             raise SystemExit(1)
         try:
-            for source in SOURCES:
+            for source in sources:
+                remaining_total = max_total_messages - fetched_count
+                if remaining_total <= 0:
+                    logger.info("Reached total ingest limit; stopping.", extra={"max_total_messages": max_total_messages})
+                    break
                 try:
                     entity = await client.get_entity(source)
                     chat_id = entity.id
                     last_message_id = _ensure_offset(chat_id)
-                    logger.info("Reading source", extra={"source": source, "last_message_id": last_message_id})
+                    logger.info(
+                        "Reading source",
+                        extra={
+                            "source": source,
+                            "entity_id": chat_id,
+                            "entity_title": getattr(entity, "title", None),
+                            "entity_username": getattr(entity, "username", None),
+                            "last_message_id": last_message_id,
+                        },
+                    )
 
                     new_messages = []
                     max_message_id = last_message_id
+                    per_source_limit = min(max_messages_per_source, remaining_total)
                     async for message in client.iter_messages(
                         entity,
                         min_id=last_message_id,
                         offset_id=last_message_id,
                         reverse=True,
-                        limit=MAX_MESSAGES_PER_SOURCE,
+                        limit=per_source_limit,
                     ):
                         if message.id is None:
                             continue
