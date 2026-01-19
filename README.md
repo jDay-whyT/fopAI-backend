@@ -178,20 +178,55 @@ curl -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/setWebhook" \
   -d "secret_token=$TG_BOT_TOKEN"
 ```
 
-## Smoke tests
+## Smoke test
 
-Trigger an ingest run and verify Pub/Sub delivery:
+Use these PowerShell commands to run an end-to-end ingest → Pub/Sub → processor → approver → Telegram smoke test with traceable logs.
 
-```bash
-gcloud run jobs execute ingest
-gcloud pubsub topics publish tg-raw-ingested --message='{\"ok\":true}'
+```powershell
+$PROJECT_ID = "your-project-id"
+$REGION = "us-central1"
+$INGEST_JOB = "ingest"
+$PROCESSOR_SERVICE = "processor"
+$APPROVER_SERVICE = "approver"
+
+gcloud config set project $PROJECT_ID
+gcloud run jobs execute $INGEST_JOB --region $REGION --wait
 ```
 
-Send a direct push payload to the processor using a local `body.json`:
+Grab the latest trace ID from the ingest publish log:
 
-```bash
-echo '{\"message\":{\"data\":\"'$(printf '{\"ok\":true}' | base64 -w 0)'\",\"messageId\":\"1\"},\"subscription\":\"test\"}' > body.json
-curl -X POST https://PROCESSOR_URL/pubsub/push -H \"Content-Type: application/json\" --data @body.json
+```powershell
+$TRACE_ID = gcloud logging read `
+  "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$INGEST_JOB\" AND jsonPayload.event=\"ingest_pubsub_publish\"" `
+  --limit 1 `
+  --format="value(jsonPayload.trace_id)"
+```
+
+Verify ingest source summary and publish counts:
+
+```powershell
+gcloud logging read `
+  "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$INGEST_JOB\" AND jsonPayload.event=\"ingest_source_summary\"" `
+  --limit 50 `
+  --format="table(timestamp,jsonPayload.source,jsonPayload.found,jsonPayload.inserted,jsonPayload.published,jsonPayload.new_offset)"
+```
+
+Verify processor handled the Pub/Sub push for the same trace ID:
+
+```powershell
+gcloud logging read `
+  "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$PROCESSOR_SERVICE\" AND jsonPayload.trace_id=\"$TRACE_ID\"" `
+  --limit 50 `
+  --format="table(timestamp,jsonPayload.event,jsonPayload.raw_id,jsonPayload.draft_id,jsonPayload.status)"
+```
+
+Verify approver received the notify and sent a Telegram message:
+
+```powershell
+gcloud logging read `
+  "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$APPROVER_SERVICE\" AND jsonPayload.trace_id=\"$TRACE_ID\"" `
+  --limit 50 `
+  --format="table(timestamp,jsonPayload.event,jsonPayload.draft_id,jsonPayload.status)"
 ```
 
 ## Cloud Scheduler

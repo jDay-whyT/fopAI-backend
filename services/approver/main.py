@@ -66,7 +66,7 @@ def healthz() -> dict[str, str]:
 
 
 @app.post("/internal/notify")
-async def notify(payload: dict) -> dict[str, str]:
+async def notify(payload: dict, x_trace_id: str | None = Header(default=None)) -> dict[str, str]:
     draft_id = payload.get("draft_id")
     if not draft_id:
         raise HTTPException(status_code=400, detail="draft_id missing")
@@ -74,19 +74,38 @@ async def notify(payload: dict) -> dict[str, str]:
         draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
         if not draft:
             raise HTTPException(status_code=404, detail="draft not found")
-        logger.info("internal_notify_received", extra={"draft_id": draft_id, "status": draft.status})
+        logger.info(
+            "internal_notify_received",
+            extra={"event": "internal_notify_received", "draft_id": draft_id, "status": draft.status, "trace_id": x_trace_id},
+        )
         if draft.status != "INGEST":
             return {"status": "ignored"}
         raw_message = connection.execute(
             select(raw_messages).where(raw_messages.c.id == draft.raw_id)
         ).fetchone()
         if not raw_message:
-            logger.warning("draft_raw_message_missing", extra={"draft_id": draft_id, "raw_id": draft.raw_id})
+            logger.warning(
+                "draft_raw_message_missing",
+                extra={"event": "draft_raw_message_missing", "draft_id": draft_id, "raw_id": draft.raw_id, "trace_id": x_trace_id},
+            )
         else:
             try:
                 _send_ingest_raw_message(draft, raw_message)
+                logger.info(
+                    "internal_notify_sent",
+                    extra={"event": "internal_notify_sent", "draft_id": draft_id, "status": "ok", "trace_id": x_trace_id},
+                )
             except Exception as exc:  # noqa: BLE001 - do not fail notify on Telegram errors
-                logger.warning("notify_send_failed", extra={"draft_id": draft_id, "error": str(exc)})
+                logger.warning(
+                    "notify_send_failed",
+                    extra={
+                        "event": "notify_send_failed",
+                        "draft_id": draft_id,
+                        "status": "failed",
+                        "trace_id": x_trace_id,
+                        "error": str(exc),
+                    },
+                )
             return {"status": "sent"}
     return {"status": "sent"}
 
