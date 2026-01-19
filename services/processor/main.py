@@ -31,7 +31,7 @@ def healthz() -> dict[str, str]:
 
 @app.post("/pubsub/push")
 async def pubsub_push(request: Request, authorization: str | None = Header(default=None)) -> Response:
-    logger.info("Pub/Sub push received")
+    logger.info("pubsub_push_received", extra={"event": "pubsub_push_received"})
     try:
         payload = await request.json()
     except Exception:
@@ -80,6 +80,9 @@ async def pubsub_push(request: Request, authorization: str | None = Header(defau
         return Response(status_code=204)
 
     raw_id = message.get("raw_id")
+    chat_id = message.get("chat_id")
+    source_message_id = message.get("message_id")
+    trace_id = message.get("trace_id")
     if not raw_id:
         logger.warning(
             "pubsub_reject",
@@ -94,14 +97,29 @@ async def pubsub_push(request: Request, authorization: str | None = Header(defau
 
     logger.info(
         "pubsub_accept",
-        extra={"event": "pubsub_accept", "raw_id": raw_id, "message_id": message_id},
+        extra={
+            "event": "pubsub_accept",
+            "raw_id": raw_id,
+            "chat_id": chat_id,
+            "source_message_id": source_message_id,
+            "message_id": message_id,
+            "trace_id": trace_id,
+        },
     )
 
     try:
         with db_session() as connection:
             existing = connection.execute(select(draft_posts.c.id).where(draft_posts.c.raw_id == raw_id)).fetchone()
             if existing:
-                logger.info("Draft already exists", extra={"raw_id": raw_id})
+                logger.info(
+                    "draft_exists",
+                    extra={
+                        "event": "draft_exists",
+                        "raw_id": raw_id,
+                        "message_id": message_id,
+                        "trace_id": trace_id,
+                    },
+                )
                 existing_id = existing[0]
             else:
                 existing_id = None
@@ -114,8 +132,10 @@ async def pubsub_push(request: Request, authorization: str | None = Header(defau
                     extra={
                         "event": "pubsub_done",
                         "raw_id": raw_id,
-                        "status": "raw_not_found",
+                        "status": "skipped",
+                        "reason": "raw_not_found",
                         "message_id": message_id,
+                        "trace_id": trace_id,
                     },
                 )
                 return JSONResponse(status_code=200, content={"status": "failed"})
@@ -141,28 +161,89 @@ async def pubsub_push(request: Request, authorization: str | None = Header(defau
             extra={
                 "event": "pubsub_done",
                 "raw_id": raw_id,
-                "status": "failed",
+                "status": "error",
                 "reason": "db_failed_before_persist",
                 "message_id": message_id,
+                "trace_id": trace_id,
                 "error": str(exc),
             },
         )
         return JSONResponse(status_code=200, content={"status": "failed"})
 
+    if draft_id:
+        logger.info(
+            "draft_persisted",
+            extra={
+                "event": "draft_persisted",
+                "draft_id": draft_id,
+                "status": "INGEST",
+                "raw_id": raw_id,
+                "message_id": message_id,
+                "trace_id": trace_id,
+            },
+        )
+
     if draft_id and settings.approver_notify_url:
         try:
-            requests.post(settings.approver_notify_url, json={"draft_id": draft_id}, timeout=10)
+            logger.info(
+                "approver_notify_request",
+                extra={
+                    "event": "approver_notify_request",
+                    "draft_id": draft_id,
+                    "url": settings.approver_notify_url,
+                    "trace_id": trace_id,
+                },
+            )
+            response = requests.post(
+                settings.approver_notify_url,
+                json={"draft_id": draft_id},
+                headers={"X-Trace-Id": str(trace_id)} if trace_id else None,
+                timeout=10,
+            )
+            logger.info(
+                "approver_notify_response",
+                extra={
+                    "event": "approver_notify_response",
+                    "draft_id": draft_id,
+                    "status_code": response.status_code,
+                    "trace_id": trace_id,
+                },
+            )
         except Exception as exc:
-            logger.warning("Failed to notify approver", extra={"draft_id": draft_id, "error": str(exc)})
+            logger.warning(
+                "approver_notify_failed",
+                extra={
+                    "event": "approver_notify_failed",
+                    "draft_id": draft_id,
+                    "trace_id": trace_id,
+                    "error": str(exc),
+                },
+            )
 
     if existing_id:
         logger.info(
             "pubsub_done",
-            extra={"event": "pubsub_done", "raw_id": raw_id, "status": "exists", "message_id": message_id},
+            extra={
+                "event": "pubsub_done",
+                "raw_id": raw_id,
+                "chat_id": chat_id,
+                "source_message_id": source_message_id,
+                "status": "exists",
+                "message_id": message_id,
+                "trace_id": trace_id,
+            },
         )
         return JSONResponse(status_code=200, content={"status": "exists"})
     logger.info(
         "pubsub_done",
-        extra={"event": "pubsub_done", "raw_id": raw_id, "status": "ingested", "message_id": message_id},
+        extra={
+            "event": "pubsub_done",
+            "raw_id": raw_id,
+            "chat_id": chat_id,
+            "source_message_id": source_message_id,
+            "status": "created",
+            "message_id": message_id,
+            "trace_id": trace_id,
+        },
     )
     return JSONResponse(status_code=200, content={"status": "ingested"})

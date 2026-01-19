@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from typing import Iterable
 
 import google.auth
@@ -143,8 +144,15 @@ async def ingest_once() -> None:
         DEFAULT_MAX_TOTAL_MESSAGES,
     )
     logger.info(
-        "Configured ingest sources",
-        extra={"sources": sources, "max_messages_per_source": max_messages_per_source, "max_total_messages": max_total_messages},
+        "ingest_start",
+        extra={
+            "event": "ingest_start",
+            "sources": sources,
+            "max_messages_per_source": max_messages_per_source,
+            "max_total_messages": max_total_messages,
+            "cloud_run_job": os.getenv("CLOUD_RUN_JOB"),
+            "cloud_run_execution": os.getenv("CLOUD_RUN_EXECUTION"),
+        },
     )
     logger.info("telethon mode=user")
 
@@ -217,14 +225,23 @@ async def ingest_once() -> None:
                         _update_offset(chat_id, max_message_id)
 
                     to_publish_count += len(inserted_payloads)
+                    published_for_source = 0
                     for payload in inserted_payloads:
+                        payload["trace_id"] = str(uuid.uuid4())
                         try:
                             future = publisher.publish(topic_path, json.dumps(payload).encode("utf-8"))
                             message_id = future.result(timeout=15)
                             published_count += 1
+                            published_for_source += 1
                             logger.info(
-                                "Published Pub/Sub message",
-                                extra={"message_id": message_id, "raw_id": payload["raw_id"], "source": source},
+                                "ingest_pubsub_publish",
+                                extra={
+                                    "event": "ingest_pubsub_publish",
+                                    "message_id": message_id,
+                                    "raw_id": payload["raw_id"],
+                                    "source": source,
+                                    "trace_id": payload["trace_id"],
+                                },
                             )
                         except Exception as exc:
                             logger.error(
@@ -232,14 +249,22 @@ async def ingest_once() -> None:
                                 extra={
                                     "source": source,
                                     "raw_id": payload["raw_id"],
+                                    "trace_id": payload["trace_id"],
                                     "error_type": type(exc).__name__,
                                     "error": str(exc),
                                 },
                             )
 
                     logger.info(
-                        "Ingested messages",
-                        extra={"source": source, "inserted": len(inserted_payloads), "max_message_id": max_message_id},
+                        "ingest_source_summary",
+                        extra={
+                            "event": "ingest_source_summary",
+                            "source": source,
+                            "found": len(new_messages),
+                            "inserted": len(inserted_payloads),
+                            "published": published_for_source,
+                            "new_offset": max_message_id,
+                        },
                     )
                 except AuthKeyDuplicatedError:
                     logger.error("Auth key duplicated. Stop ingest and create a fresh Telethon string session.")
