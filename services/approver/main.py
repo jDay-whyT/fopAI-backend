@@ -406,7 +406,13 @@ def _red_ingest(
         if review_message_id:
             _update_draft_meta(draft.id, {"review_message_id": review_message_id})
     if chat_id and message_id:
-        bot.delete_message(chat_id, message_id, message_thread_id=message_thread_id)
+        try:
+            bot.delete_message(chat_id, message_id)
+        except Exception as exc:  # noqa: BLE001 - do not fail webhook
+            logger.warning(
+                "telegram_delete_failed",
+                extra={"draft_id": draft_id, "chat_id": chat_id, "message_id": message_id, "error": str(exc)},
+            )
 
 
 def _skip_draft(
@@ -418,7 +424,13 @@ def _skip_draft(
     with db_session() as connection:
         connection.execute(update(draft_posts).where(draft_posts.c.id == draft_id).values(status="SKIPPED"))
     if chat_id and message_id:
-        bot.delete_message(chat_id, message_id, message_thread_id=message_thread_id)
+        try:
+            bot.delete_message(chat_id, message_id)
+        except Exception as exc:  # noqa: BLE001 - do not fail webhook
+            logger.warning(
+                "telegram_delete_failed",
+                extra={"draft_id": draft_id, "chat_id": chat_id, "message_id": message_id, "error": str(exc)},
+            )
 
 
 def _post_draft(
@@ -466,7 +478,13 @@ def _post_draft(
             )
         )
     if chat_id and message_id:
-        bot.delete_message(chat_id, message_id, message_thread_id=message_thread_id)
+        try:
+            bot.delete_message(chat_id, message_id)
+        except Exception as exc:  # noqa: BLE001 - do not fail webhook
+            logger.warning(
+                "telegram_delete_failed",
+                extra={"draft_id": draft_id, "chat_id": chat_id, "message_id": message_id, "error": str(exc)},
+            )
 
 
 def _red_review(
@@ -590,7 +608,6 @@ def _refresh_review_message(
                 message_id,
                 text,
                 reply_markup=keyboard,
-                message_thread_id=message_thread_id,
             )
             return
         except Exception as exc:  # noqa: BLE001 - fallback to new message
