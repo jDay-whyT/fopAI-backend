@@ -42,7 +42,6 @@ class TelegramBot:
         message_id: int,
         text: str,
         reply_markup: dict[str, Any] | None = None,
-        message_thread_id: int | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "chat_id": chat_id,
@@ -52,19 +51,14 @@ class TelegramBot:
         }
         if reply_markup:
             payload["reply_markup"] = json.dumps(reply_markup)
-        if message_thread_id is not None:
-            payload["message_thread_id"] = message_thread_id
         return self._post("editMessageText", payload)
 
     def delete_message(
         self,
         chat_id: int | str,
         message_id: int,
-        message_thread_id: int | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id}
-        if message_thread_id is not None:
-            payload["message_thread_id"] = message_thread_id
         return self._post("deleteMessage", payload)
 
     def answer_callback(self, callback_query_id: str, text: str) -> dict[str, Any]:
