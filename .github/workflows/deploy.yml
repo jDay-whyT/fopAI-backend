@@ -10,6 +10,8 @@ env:
   DB_INSTANCE_CONNECTION_NAME: optimum-tea-481710-u3:us-central1:fopai-postgres
   DB_NAME: fopai
   DB_USER: postgres
+  INGEST_SOURCES: ${{ vars.INGEST_SOURCES }}
+  INGEST_LIMIT: ${{ vars.INGEST_LIMIT }}
   DEBUG: "1"
 
 jobs:
@@ -200,10 +202,16 @@ jobs:
           AR_REPO: ${{ env.AR_REPO }}
           DB_INSTANCE_CONNECTION_NAME: ${{ env.DB_INSTANCE_CONNECTION_NAME }}
           DB_NAME: ${{ env.DB_NAME }}
+          DB_USER: ${{ env.DB_USER }}
           PUBSUB_TOPIC: ${{ env.PUBSUB_TOPIC }}
+          INGEST_SOURCES: ${{ env.INGEST_SOURCES }}
+          INGEST_LIMIT: ${{ env.INGEST_LIMIT }}
         run: |
           set -euo pipefail
           INGEST_IMAGE="$REGION-docker.pkg.dev/$PROJECT_ID/$AR_REPO/ingest:${{ github.sha }}"
+          test -n "$DB_USER" || (echo "Missing DB_USER env var for ingest job deployment" && exit 1)
+          test -n "$INGEST_SOURCES" || (echo "Missing INGEST_SOURCES env var for ingest job deployment" && exit 1)
+          test -n "$INGEST_LIMIT" || (echo "Missing INGEST_LIMIT env var for ingest job deployment" && exit 1)
 
           if gcloud run jobs describe ingest --region "$REGION" --project "$PROJECT_ID" >/dev/null 2>&1; then
             gcloud run jobs update ingest \
@@ -211,7 +219,7 @@ jobs:
               --region "$REGION" \
               --project "$PROJECT_ID" \
               --set-cloudsql-instances "$DB_INSTANCE_CONNECTION_NAME" \
-              --set-env-vars DB_INSTANCE_CONNECTION_NAME="$DB_INSTANCE_CONNECTION_NAME",DB_NAME="$DB_NAME",DB_USER="$DB_USER",PUBSUB_TOPIC="$PUBSUB_TOPIC" \
+              --set-env-vars DB_INSTANCE_CONNECTION_NAME="$DB_INSTANCE_CONNECTION_NAME",DB_NAME="$DB_NAME",DB_USER="$DB_USER",PUBSUB_TOPIC="$PUBSUB_TOPIC",INGEST_SOURCES="$INGEST_SOURCES",INGEST_LIMIT="$INGEST_LIMIT" \
               --set-secrets DB_PASSWORD=DB_PASSWORD:latest,TELEGRAM_API_ID=TELEGRAM_API_ID:latest,TELEGRAM_API_HASH=TELEGRAM_API_HASH:latest,TELETHON_STRING_SESSION=TELETHON_STRING_SESSION:latest
           else
             gcloud run jobs create ingest \
@@ -219,7 +227,7 @@ jobs:
               --region "$REGION" \
               --project "$PROJECT_ID" \
               --set-cloudsql-instances "$DB_INSTANCE_CONNECTION_NAME" \
-              --set-env-vars DB_INSTANCE_CONNECTION_NAME="$DB_INSTANCE_CONNECTION_NAME",DB_NAME="$DB_NAME",DB_USER="$DB_USER",PUBSUB_TOPIC="$PUBSUB_TOPIC" \
+              --set-env-vars DB_INSTANCE_CONNECTION_NAME="$DB_INSTANCE_CONNECTION_NAME",DB_NAME="$DB_NAME",DB_USER="$DB_USER",PUBSUB_TOPIC="$PUBSUB_TOPIC",INGEST_SOURCES="$INGEST_SOURCES",INGEST_LIMIT="$INGEST_LIMIT" \
               --set-secrets DB_PASSWORD=DB_PASSWORD:latest,TELEGRAM_API_ID=TELEGRAM_API_ID:latest,TELEGRAM_API_HASH=TELEGRAM_API_HASH:latest,TELETHON_STRING_SESSION=TELETHON_STRING_SESSION:latest
           fi
 
