@@ -46,6 +46,13 @@ def _get_pubsub_client() -> pubsub_v1.PublisherClient:
     return pubsub_v1.PublisherClient()
 
 
+def _normalize_source(value: str) -> str:
+    cleaned = value.strip()
+    if cleaned.startswith("@"):
+        cleaned = cleaned[1:]
+    return cleaned
+
+
 def _parse_sources(value: str | None) -> list[str]:
     raw_items = (value or "").split(",")
     cleaned_items = [item.strip() for item in raw_items]
@@ -54,10 +61,13 @@ def _parse_sources(value: str | None) -> list[str]:
     for item in cleaned_items:
         if not item:
             continue
-        if item in seen:
+        normalized = _normalize_source(item)
+        if not normalized:
             continue
-        sources.append(item)
-        seen.add(item)
+        if normalized in seen:
+            continue
+        sources.append(normalized)
+        seen.add(normalized)
     if not sources:
         raise RuntimeError(
             "INGEST_SOURCES is required and must list Telegram sources "
@@ -183,11 +193,12 @@ async def ingest_once() -> None:
                 try:
                     entity = await client.get_entity(source)
                     chat_id = entity.id
+                    normalized_source = _normalize_source(source)
                     last_message_id = _ensure_offset(chat_id)
                     logger.info(
                         "Reading source",
                         extra={
-                            "source": source,
+                            "source": normalized_source,
                             "entity_id": chat_id,
                             "entity_title": getattr(entity, "title", None),
                             "entity_username": getattr(entity, "username", None),
@@ -214,7 +225,12 @@ async def ingest_once() -> None:
                                 "message_id": message.id,
                                 "date": message.date,
                                 "text": message.message,
-                                "meta_json": {"source": source},
+                                "meta_json": {
+                                    "source": normalized_source,
+                                    "entity_id": chat_id,
+                                    "entity_title": getattr(entity, "title", None),
+                                    "entity_username": getattr(entity, "username", None),
+                                },
                             }
                         )
 
@@ -228,6 +244,7 @@ async def ingest_once() -> None:
                     published_for_source = 0
                     for payload in inserted_payloads:
                         payload["trace_id"] = str(uuid.uuid4())
+                        payload["source"] = normalized_source
                         try:
                             future = publisher.publish(topic_path, json.dumps(payload).encode("utf-8"))
                             message_id = future.result(timeout=15)
@@ -239,7 +256,10 @@ async def ingest_once() -> None:
                                     "event": "ingest_pubsub_publish",
                                     "message_id": message_id,
                                     "raw_id": payload["raw_id"],
-                                    "source": source,
+                                    "source": normalized_source,
+                                    "entity_id": chat_id,
+                                    "chat_id": chat_id,
+                                    "message_id": payload["message_id"],
                                     "trace_id": payload["trace_id"],
                                 },
                             )
@@ -247,8 +267,11 @@ async def ingest_once() -> None:
                             logger.error(
                                 "Failed to publish Pub/Sub message",
                                 extra={
-                                    "source": source,
+                                    "source": normalized_source,
                                     "raw_id": payload["raw_id"],
+                                    "entity_id": chat_id,
+                                    "chat_id": chat_id,
+                                    "message_id": payload["message_id"],
                                     "trace_id": payload["trace_id"],
                                     "error_type": type(exc).__name__,
                                     "error": str(exc),
@@ -259,7 +282,8 @@ async def ingest_once() -> None:
                         "ingest_source_summary",
                         extra={
                             "event": "ingest_source_summary",
-                            "source": source,
+                            "source": normalized_source,
+                            "entity_id": chat_id,
                             "found": len(new_messages),
                             "inserted": len(inserted_payloads),
                             "published": published_for_source,
