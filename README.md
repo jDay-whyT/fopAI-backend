@@ -67,8 +67,7 @@ Non-secret env vars:
 - `PUBSUB_VERIFICATION_AUDIENCE` (Cloud Run service URL for processor)
 - `APPROVER_NOTIFY_URL` (approver internal notify endpoint URL)
 - `INGEST_SOURCES` (comma-separated Telegram source usernames or numeric IDs)
-- `INGEST_MAX_MESSAGES_PER_SOURCE` (optional; default `50`)
-- `INGEST_MAX_TOTAL_MESSAGES` (optional; default `200`)
+- `INGEST_LIMIT` (optional; default `50`; fallback to `INGEST_MAX_MESSAGES_PER_SOURCE` if still set)
 
 For local development, copy `.env.example` to `.env`.
 
@@ -81,7 +80,7 @@ Set environment variables on the ingest Cloud Run Job:
 ```bash
 gcloud run jobs update ingest \
   --set-env-vars INGEST_SOURCES="@Minfin_com_ua,verkhovnaradaukrainy,123456789" \
-  --set-env-vars INGEST_MAX_MESSAGES_PER_SOURCE=50,INGEST_MAX_TOTAL_MESSAGES=200
+  --set-env-vars INGEST_LIMIT=50
 ```
 
 Example configurations:
@@ -95,8 +94,29 @@ Example configurations:
   ```bash
   gcloud run jobs update ingest \
     --set-env-vars INGEST_SOURCES="@nbu_ua,987654321" \
-    --set-env-vars INGEST_MAX_MESSAGES_PER_SOURCE=20,INGEST_MAX_TOTAL_MESSAGES=60
+    --set-env-vars INGEST_LIMIT=20
   ```
+
+## Ingest health check (quick)
+
+1) Run ingest twice; the second run should fetch/publish ~0.
+
+```bash
+gcloud run jobs execute ingest --region us-central1 --wait
+gcloud run jobs execute ingest --region us-central1 --wait
+```
+
+2) Check ingest logs for a single execution (use the execution name from the command output):
+
+```bash
+EXECUTION_NAME="ingest-00000-abc"
+gcloud logging read \
+  "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"ingest\" AND resource.labels.execution_name=\"$EXECUTION_NAME\" AND jsonPayload.event=\"ingest_source_state\"" \
+  --limit 50 \
+  --format="table(timestamp,jsonPayload.source,jsonPayload.entity_username,jsonPayload.entity_title,jsonPayload.fetched_count,jsonPayload.inserted_count,jsonPayload.published_count,jsonPayload.last_message_id_before,jsonPayload.last_message_id_after)"
+```
+
+3) Verify sources are the intended ones (same log line above shows `entity_username`, `entity_title`, and `entity_id/chat_id`).
 
 ## Secrets bootstrap
 
@@ -206,9 +226,9 @@ Verify ingest source summary and publish counts:
 
 ```powershell
 gcloud logging read `
-  "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$INGEST_JOB\" AND jsonPayload.event=\"ingest_source_summary\"" `
+  "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$INGEST_JOB\" AND jsonPayload.event=\"ingest_source_state\"" `
   --limit 50 `
-  --format="table(timestamp,jsonPayload.source,jsonPayload.found,jsonPayload.inserted,jsonPayload.published,jsonPayload.new_offset)"
+  --format="table(timestamp,jsonPayload.source,jsonPayload.fetched_count,jsonPayload.inserted_count,jsonPayload.published_count,jsonPayload.last_message_id_after)"
 ```
 
 Verify ingest source metadata matches the Telegram ingest topic:
