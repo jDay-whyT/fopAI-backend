@@ -21,8 +21,6 @@ from shared.models import offsets, raw_messages
 from shared.settings import settings
 
 DEFAULT_INGEST_LIMIT = 50
-DEFAULT_MAX_MESSAGES_PER_SOURCE = 50
-DEFAULT_MAX_TOTAL_MESSAGES = 200
 
 logger = logging.getLogger("ingest")
 TELETHON_STRING_SESSION_PREFIX = "1"
@@ -77,16 +75,18 @@ def _parse_sources(value: str | None) -> list[str]:
     return sources
 
 
-def _get_env_int(name: str, default: int) -> int:
-    raw_value = os.getenv(name)
-    if raw_value is None or raw_value.strip() == "":
-        return default
+def _get_ingest_limit() -> int:
+    raw_limit = os.getenv("INGEST_LIMIT")
+    if raw_limit is None or raw_limit.strip() == "":
+        raw_limit = os.getenv("INGEST_MAX_MESSAGES_PER_SOURCE")
+    if raw_limit is None or raw_limit.strip() == "":
+        return DEFAULT_INGEST_LIMIT
     try:
-        value = int(raw_value)
+        value = int(raw_limit)
     except ValueError as exc:
-        raise RuntimeError(f"{name} must be an integer.") from exc
+        raise RuntimeError("INGEST_LIMIT must be an integer.") from exc
     if value <= 0:
-        raise RuntimeError(f"{name} must be greater than zero.")
+        raise RuntimeError("INGEST_LIMIT must be greater than zero.")
     return value
 
 
@@ -149,23 +149,13 @@ async def ingest_once() -> None:
         logger.warning("TG_BOT_TOKEN is set but will be ignored; ingest runs in user mode only.")
     telethon_string_session = _validate_telethon_string_session(settings.telethon_string_session)
     sources = _parse_sources(os.getenv("INGEST_SOURCES"))
-    ingest_limit = _get_env_int("INGEST_LIMIT", DEFAULT_INGEST_LIMIT)
-    max_messages_per_source = _get_env_int(
-        "INGEST_MAX_MESSAGES_PER_SOURCE",
-        DEFAULT_MAX_MESSAGES_PER_SOURCE,
-    )
-    max_total_messages = _get_env_int(
-        "INGEST_MAX_TOTAL_MESSAGES",
-        DEFAULT_MAX_TOTAL_MESSAGES,
-    )
+    ingest_limit = _get_ingest_limit()
     logger.info(
         "ingest_start",
         extra={
             "event": "ingest_start",
-            "sources": sources,
             "ingest_limit": ingest_limit,
-            "max_messages_per_source": max_messages_per_source,
-            "max_total_messages": max_total_messages,
+            "sources_count": len(sources),
             "cloud_run_job": os.getenv("CLOUD_RUN_JOB"),
             "cloud_run_execution": os.getenv("CLOUD_RUN_EXECUTION"),
         },
@@ -192,44 +182,39 @@ async def ingest_once() -> None:
             raise SystemExit(1)
         try:
             for source in sources:
-                remaining_total = max_total_messages - fetched_count
-                if remaining_total <= 0:
-                    logger.info("Reached total ingest limit; stopping.", extra={"max_total_messages": max_total_messages})
-                    break
                 try:
                     entity = await client.get_entity(source)
                     chat_id = entity.id
                     normalized_source = _normalize_source(source)
                     last_message_id_before = _get_offset(chat_id)
-                    is_first_run = last_message_id_before is None
+                    is_first_run = not last_message_id_before
                     logger.info(
-                        "Reading source",
+                        "ingest_source_fetch",
                         extra={
+                            "event": "ingest_source_fetch",
                             "source": normalized_source,
                             "entity_id": chat_id,
                             "entity_title": getattr(entity, "title", None),
                             "entity_username": getattr(entity, "username", None),
                             "last_message_id": last_message_id_before,
                             "is_first_run": is_first_run,
+                            "ingest_limit": ingest_limit,
                         },
                     )
 
                     new_messages = []
                     max_message_id = last_message_id_before or 0
-                    per_source_limit = min(max_messages_per_source, remaining_total)
                     if is_first_run:
-                        per_source_limit = min(per_source_limit, ingest_limit)
                         message_iterator = client.iter_messages(
                             entity,
-                            reverse=True,
-                            limit=per_source_limit,
+                            limit=ingest_limit,
                         )
                     else:
                         message_iterator = client.iter_messages(
                             entity,
                             min_id=last_message_id_before,
                             reverse=True,
-                            limit=per_source_limit,
+                            limit=ingest_limit,
                         )
                     async for message in message_iterator:
                         if message.id is None:
@@ -249,6 +234,8 @@ async def ingest_once() -> None:
                                 },
                             }
                         )
+                    if is_first_run:
+                        new_messages.reverse()
 
                     fetched_count += len(new_messages)
                     inserted_payloads = _insert_raw_messages(new_messages)
@@ -295,18 +282,19 @@ async def ingest_once() -> None:
                             )
 
                     logger.info(
-                        "ingest_source_summary",
+                        "ingest_source_state",
                         extra={
-                            "event": "ingest_source_summary",
+                            "event": "ingest_source_state",
                             "source": normalized_source,
                             "entity_id": chat_id,
-                            "last_message_id_before": last_message_id_before,
-                            "last_message_id_after": max_message_id if max_message_id > 0 else last_message_id_before,
+                            "chat_id": chat_id,
+                            "entity_title": getattr(entity, "title", None),
+                            "entity_username": getattr(entity, "username", None),
+                            "last_message_id_before": last_message_id_before or 0,
+                            "last_message_id_after": max_message_id if max_message_id > 0 else (last_message_id_before or 0),
                             "fetched_count": len(new_messages),
-                            "found": len(new_messages),
-                            "inserted": len(inserted_payloads),
-                            "published": published_for_source,
-                            "new_offset": max_message_id,
+                            "inserted_count": len(inserted_payloads),
+                            "published_count": published_for_source,
                         },
                     )
                 except AuthKeyDuplicatedError:
@@ -328,8 +316,9 @@ async def ingest_once() -> None:
             if to_publish_count == 0:
                 logger.info("No new messages found; nothing to publish.")
             logger.info(
-                "Ingest totals",
+                "ingest_totals",
                 extra={
+                    "event": "ingest_totals",
                     "fetched_count": fetched_count,
                     "inserted_count": inserted_count,
                     "to_publish_count": to_publish_count,
