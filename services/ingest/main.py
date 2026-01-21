@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 from typing import Iterable
 
@@ -24,6 +25,7 @@ DEFAULT_INGEST_LIMIT = 50
 
 logger = logging.getLogger("ingest")
 TELETHON_STRING_SESSION_PREFIX = "1"
+SOURCE_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 
 def _validate_telethon_string_session(value: str | None) -> str:
@@ -65,6 +67,11 @@ def _parse_sources(value: str | None) -> list[str]:
             continue
         if normalized in seen:
             continue
+        if not SOURCE_USERNAME_RE.fullmatch(normalized):
+            raise RuntimeError(
+                "INGEST_SOURCES must contain only Telegram usernames (letters, numbers, underscores) "
+                "without '@'."
+            )
         sources.append(normalized)
         seen.add(normalized)
     if not sources:
@@ -97,19 +104,21 @@ def _topic_path(client: pubsub_v1.PublisherClient) -> str:
     return client.topic_path(project_id, settings.pubsub_topic)
 
 
-def _get_offset(chat_id: int) -> int | None:
+def _get_offset(source_id: int) -> int | None:
     with db_session() as connection:
-        existing = connection.execute(select(offsets.c.last_message_id).where(offsets.c.chat_id == chat_id)).fetchone()
+        existing = connection.execute(
+            select(offsets.c.last_message_id).where(offsets.c.chat_id == source_id)
+        ).fetchone()
         if existing:
             return existing[0]
     return None
 
 
-def _upsert_offset(chat_id: int, last_message_id: int) -> None:
+def _upsert_offset(source_id: int, last_message_id: int) -> None:
     with db_session() as connection:
         stmt = (
             pg_insert(offsets)
-            .values(chat_id=chat_id, last_message_id=last_message_id, updated_at=func.now())
+            .values(chat_id=source_id, last_message_id=last_message_id, updated_at=func.now())
             .on_conflict_do_update(
                 index_elements=["chat_id"],
                 set_={"last_message_id": last_message_id, "updated_at": func.now()},
@@ -186,8 +195,20 @@ async def ingest_once() -> None:
                     entity = await client.get_entity(source)
                     chat_id = entity.id
                     normalized_source = _normalize_source(source)
+                    entity_username = _normalize_source(getattr(entity, "username", "") or "")
+                    if entity_username and entity_username.casefold() != normalized_source.casefold():
+                        logger.warning(
+                            "ingest_source_skip",
+                            extra={
+                                "event": "ingest_source_skip",
+                                "source": normalized_source,
+                                "resolved_username": entity_username,
+                                "reason": "resolved_username_mismatch",
+                            },
+                        )
+                        continue
                     last_message_id_before = _get_offset(chat_id)
-                    is_first_run = not last_message_id_before
+                    is_first_run = last_message_id_before is None
                     logger.info(
                         "ingest_source_fetch",
                         extra={
@@ -219,6 +240,8 @@ async def ingest_once() -> None:
                     async for message in message_iterator:
                         if message.id is None:
                             continue
+                        if last_message_id_before is not None and message.id <= last_message_id_before:
+                            continue
                         max_message_id = max(max_message_id, message.id)
                         new_messages.append(
                             {
@@ -248,8 +271,13 @@ async def ingest_once() -> None:
                     for payload in inserted_payloads:
                         payload["trace_id"] = str(uuid.uuid4())
                         payload["source"] = normalized_source
+                        payload["key"] = f"{normalized_source}:{payload['message_id']}"
                         try:
-                            future = publisher.publish(topic_path, json.dumps(payload).encode("utf-8"))
+                            future = publisher.publish(
+                                topic_path,
+                                json.dumps(payload).encode("utf-8"),
+                                key=payload["key"],
+                            )
                             message_id = future.result(timeout=15)
                             published_count += 1
                             published_for_source += 1
@@ -263,6 +291,7 @@ async def ingest_once() -> None:
                                     "entity_id": chat_id,
                                     "chat_id": chat_id,
                                     "message_id": payload["message_id"],
+                                    "key": payload["key"],
                                     "trace_id": payload["trace_id"],
                                 },
                             )
@@ -275,6 +304,7 @@ async def ingest_once() -> None:
                                     "entity_id": chat_id,
                                     "chat_id": chat_id,
                                     "message_id": payload["message_id"],
+                                    "key": payload["key"],
                                     "trace_id": payload["trace_id"],
                                     "error_type": type(exc).__name__,
                                     "error": str(exc),
@@ -286,14 +316,9 @@ async def ingest_once() -> None:
                         extra={
                             "event": "ingest_source_state",
                             "source": normalized_source,
-                            "entity_id": chat_id,
-                            "chat_id": chat_id,
-                            "entity_title": getattr(entity, "title", None),
-                            "entity_username": getattr(entity, "username", None),
                             "last_message_id_before": last_message_id_before or 0,
                             "last_message_id_after": max_message_id if max_message_id > 0 else (last_message_id_before or 0),
                             "fetched_count": len(new_messages),
-                            "inserted_count": len(inserted_payloads),
                             "published_count": published_for_source,
                         },
                     )
@@ -319,10 +344,9 @@ async def ingest_once() -> None:
                 "ingest_totals",
                 extra={
                     "event": "ingest_totals",
-                    "fetched_count": fetched_count,
-                    "inserted_count": inserted_count,
-                    "to_publish_count": to_publish_count,
-                    "published_count": published_count,
+                    "sources": len(sources),
+                    "total_fetched": fetched_count,
+                    "total_published": published_count,
                 },
             )
             await client.disconnect()
