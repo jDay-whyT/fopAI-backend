@@ -76,7 +76,13 @@ async def notify(payload: dict, x_trace_id: str | None = Header(default=None)) -
             raise HTTPException(status_code=404, detail="draft not found")
         logger.info(
             "internal_notify_received",
-            extra={"event": "internal_notify_received", "draft_id": draft_id, "status": draft.status, "trace_id": x_trace_id},
+            extra={
+                "event": "internal_notify_received",
+                "draft_id": draft_id,
+                "raw_id": draft.raw_id,
+                "status": draft.status,
+                "trace_id": x_trace_id,
+            },
         )
         if draft.status != "INGEST":
             return {"status": "ignored"}
@@ -86,14 +92,32 @@ async def notify(payload: dict, x_trace_id: str | None = Header(default=None)) -
         if not raw_message:
             logger.warning(
                 "draft_raw_message_missing",
-                extra={"event": "draft_raw_message_missing", "draft_id": draft_id, "raw_id": draft.raw_id, "trace_id": x_trace_id},
+                extra={
+                    "event": "draft_raw_message_missing",
+                    "draft_id": draft_id,
+                    "raw_id": draft.raw_id,
+                    "trace_id": x_trace_id,
+                },
             )
         else:
+            raw_meta = dict(raw_message.meta_json or {})
+            source = raw_meta.get("entity_username") or raw_meta.get("source")
+            entity_id = raw_meta.get("entity_id")
             try:
-                _send_ingest_raw_message(draft, raw_message)
+                _send_ingest_raw_message(draft, raw_message, x_trace_id)
                 logger.info(
                     "internal_notify_sent",
-                    extra={"event": "internal_notify_sent", "draft_id": draft_id, "status": "ok", "trace_id": x_trace_id},
+                    extra={
+                        "event": "internal_notify_sent",
+                        "draft_id": draft_id,
+                        "raw_id": draft.raw_id,
+                        "source": source,
+                        "entity_id": entity_id,
+                        "chat_id": raw_message.chat_id,
+                        "message_id": raw_message.message_id,
+                        "status": "ok",
+                        "trace_id": x_trace_id,
+                    },
                 )
             except Exception as exc:  # noqa: BLE001 - do not fail notify on Telegram errors
                 logger.warning(
@@ -101,6 +125,11 @@ async def notify(payload: dict, x_trace_id: str | None = Header(default=None)) -
                     extra={
                         "event": "notify_send_failed",
                         "draft_id": draft_id,
+                        "raw_id": draft.raw_id,
+                        "source": source,
+                        "entity_id": entity_id,
+                        "chat_id": raw_message.chat_id,
+                        "message_id": raw_message.message_id,
                         "status": "failed",
                         "trace_id": x_trace_id,
                         "error": str(exc),
@@ -205,17 +234,60 @@ def _format_draft_text(draft: Any) -> str:
 
 
 def _format_raw_text(raw_message: Any, draft: Any) -> str:
-    header = f"Raw ingest: {draft.id}"
-    raw_text = html.escape(raw_message.text or "")
-    return f"{header}\n\n{raw_text}".strip()
+    raw_meta = dict(raw_message.meta_json or {})
+    source = raw_meta.get("entity_username") or raw_meta.get("source") or "unknown"
+    source_str = str(source)
+    if source_str and not source_str.startswith("@"):
+        source_str = f"@{source_str}"
+    entity_title = raw_meta.get("entity_title") or ""
+    entity_id = raw_meta.get("entity_id") or "unknown"
+    header_parts = [f"Source: {source_str}"]
+    if entity_title:
+        header_parts.append(str(entity_title))
+    header_parts.append(f"entity_id={entity_id}")
+    header = " | ".join(header_parts)
+    ids_line = (
+        f"raw_id={draft.raw_id} chat_id={raw_message.chat_id} msg_id={raw_message.message_id}"
+    )
+    raw_text = (raw_message.text or "").strip()
+    preview = html.escape(raw_text[:800])
+    return f"{header}\n{ids_line}\n\n{preview}".strip()
 
 
-def _send_ingest_raw_message(draft: Any, raw_message: Any) -> None:
+def _has_text(raw_message: Any) -> bool:
+    return bool((raw_message.text or "").strip())
+
+
+def _send_ingest_raw_message(draft: Any, raw_message: Any, trace_id: str | None) -> None:
     if not settings.admin_chat_id:
         logger.info("admin_chat_id_missing")
         return
     if settings.ingest_thread_id is None:
         logger.info("ingest_thread_id_missing")
+    raw_meta = dict(raw_message.meta_json or {})
+    source = raw_meta.get("entity_username") or raw_meta.get("source")
+    entity_id = raw_meta.get("entity_id")
+    if not _has_text(raw_message):
+        logger.info(
+            "approver_skip_empty_text",
+            extra={
+                "event": "approver_skip_empty_text",
+                "draft_id": draft.id,
+                "raw_id": draft.raw_id,
+                "source": source,
+                "entity_id": entity_id,
+                "chat_id": raw_message.chat_id,
+                "message_id": raw_message.message_id,
+                "trace_id": trace_id,
+            },
+        )
+        with db_session() as connection:
+            connection.execute(
+                update(draft_posts)
+                .where(draft_posts.c.id == draft.id)
+                .values(status="SKIPPED", reason="empty_text")
+            )
+        return
     text = _format_raw_text(raw_message, draft)
     keyboard = {
         "inline_keyboard": [
@@ -239,6 +311,10 @@ def _send_ingest_raw_message(draft: Any, raw_message: Any) -> None:
                 "chat_id": settings.admin_chat_id,
                 "thread_id": settings.ingest_thread_id,
                 "draft_id": draft.id,
+                "raw_id": draft.raw_id,
+                "source": source,
+                "entity_id": entity_id,
+                "trace_id": trace_id,
                 "error": str(exc),
             },
         )
@@ -253,6 +329,9 @@ def _send_ingest_raw_message(draft: Any, raw_message: Any) -> None:
                 "telegram_message_id": message_id,
                 "draft_id": draft.id,
                 "raw_id": draft.raw_id,
+                "source": source,
+                "entity_id": entity_id,
+                "trace_id": trace_id,
             },
         )
         _update_draft_meta(draft.id, {"ingest_message_id": message_id})

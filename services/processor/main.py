@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 
 import requests
 
@@ -17,6 +18,72 @@ from shared.settings import settings
 
 logger = logging.getLogger("processor")
 app = FastAPI()
+
+
+def _normalize_source(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if cleaned.startswith("@"):
+        cleaned = cleaned[1:]
+    return cleaned or None
+
+
+def _parse_sources(value: str | None) -> list[str]:
+    raw_items = (value or "").split(",")
+    cleaned_items = [item.strip() for item in raw_items]
+    sources: list[str] = []
+    seen = set()
+    for item in cleaned_items:
+        if not item:
+            continue
+        normalized = _normalize_source(item)
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        sources.append(normalized)
+        seen.add(normalized)
+    if not sources:
+        raise RuntimeError(
+            "INGEST_SOURCES is required and must list Telegram sources "
+            "(comma-separated usernames or numeric IDs)."
+        )
+    return sources
+
+
+def _is_valid_text(text: str | None, minimum_length: int = 20) -> bool:
+    if text is None:
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return len(stripped) >= minimum_length
+
+
+def _update_raw_meta(raw_id: int, updates: dict[str, str]) -> None:
+    if not updates:
+        return
+    with db_session() as connection:
+        raw_row = connection.execute(
+            select(raw_messages.c.id, raw_messages.c.meta_json).where(raw_messages.c.id == raw_id)
+        ).fetchone()
+        if not raw_row:
+            return
+        current = dict(raw_row.meta_json or {})
+        current.update(updates)
+        connection.execute(
+            text("UPDATE raw_messages SET meta_json = :meta_json WHERE id = :raw_id"),
+            {"meta_json": current, "raw_id": raw_id},
+        )
+
+
+def _mark_draft_skipped(draft_id: int, reason: str) -> None:
+    with db_session() as connection:
+        connection.execute(
+            text("UPDATE draft_posts SET status = :status, reason = :reason WHERE id = :draft_id"),
+            {"status": "SKIPPED", "reason": reason, "draft_id": draft_id},
+        )
 
 
 @app.on_event("startup")
@@ -109,7 +176,9 @@ async def pubsub_push(request: Request, authorization: str | None = Header(defau
 
     try:
         with db_session() as connection:
-            existing = connection.execute(select(draft_posts.c.id).where(draft_posts.c.raw_id == raw_id)).fetchone()
+            existing = connection.execute(
+                select(draft_posts.c.id, draft_posts.c.status).where(draft_posts.c.raw_id == raw_id)
+            ).fetchone()
             if existing:
                 logger.info(
                     "draft_exists",
@@ -121,8 +190,10 @@ async def pubsub_push(request: Request, authorization: str | None = Header(defau
                     },
                 )
                 existing_id = existing[0]
+                existing_status = existing[1]
             else:
                 existing_id = None
+                existing_status = None
 
         with db_session() as connection:
             raw = connection.execute(select(raw_messages).where(raw_messages.c.id == raw_id)).fetchone()
@@ -139,6 +210,44 @@ async def pubsub_push(request: Request, authorization: str | None = Header(defau
                     },
                 )
                 return JSONResponse(status_code=200, content={"status": "failed"})
+            raw_meta = dict(raw.meta_json or {})
+            source = _normalize_source(raw_meta.get("source") or raw_meta.get("entity_username"))
+            entity_id = raw_meta.get("entity_id")
+            allowlist_sources = _parse_sources(os.getenv("INGEST_SOURCES"))
+            if not source or source not in allowlist_sources:
+                logger.info(
+                    "processor_drop_not_allowed_source",
+                    extra={
+                        "event": "processor_drop_not_allowed_source",
+                        "raw_id": raw_id,
+                        "source": source,
+                        "entity_id": entity_id,
+                        "chat_id": raw.chat_id,
+                        "message_id": raw.message_id,
+                        "trace_id": trace_id,
+                    },
+                )
+                _update_raw_meta(raw_id, {"reason": "not_allowed_source"})
+                if existing_id and existing_status == "INGEST":
+                    _mark_draft_skipped(existing_id, "not_allowed_source")
+                return JSONResponse(status_code=200, content={"status": "skipped"})
+            if not _is_valid_text(raw.text):
+                logger.info(
+                    "processor_drop_empty_text",
+                    extra={
+                        "event": "processor_drop_empty_text",
+                        "raw_id": raw_id,
+                        "source": source,
+                        "entity_id": entity_id,
+                        "chat_id": raw.chat_id,
+                        "message_id": raw.message_id,
+                        "trace_id": trace_id,
+                    },
+                )
+                _update_raw_meta(raw_id, {"reason": "empty_text"})
+                if existing_id and existing_status == "INGEST":
+                    _mark_draft_skipped(existing_id, "empty_text")
+                return JSONResponse(status_code=200, content={"status": "skipped"})
 
         draft_id = None
         with db_session() as connection:
@@ -178,6 +287,10 @@ async def pubsub_push(request: Request, authorization: str | None = Header(defau
                 "draft_id": draft_id,
                 "status": "INGEST",
                 "raw_id": raw_id,
+                "source": source,
+                "entity_id": entity_id,
+                "chat_id": raw.chat_id,
+                "source_message_id": raw.message_id,
                 "message_id": message_id,
                 "trace_id": trace_id,
             },
@@ -190,6 +303,11 @@ async def pubsub_push(request: Request, authorization: str | None = Header(defau
                 extra={
                     "event": "approver_notify_request",
                     "draft_id": draft_id,
+                    "raw_id": raw_id,
+                    "source": source,
+                    "entity_id": entity_id,
+                    "chat_id": raw.chat_id,
+                    "message_id": raw.message_id,
                     "url": settings.approver_notify_url,
                     "trace_id": trace_id,
                 },
@@ -205,6 +323,11 @@ async def pubsub_push(request: Request, authorization: str | None = Header(defau
                 extra={
                     "event": "approver_notify_response",
                     "draft_id": draft_id,
+                    "raw_id": raw_id,
+                    "source": source,
+                    "entity_id": entity_id,
+                    "chat_id": raw.chat_id,
+                    "message_id": raw.message_id,
                     "status_code": response.status_code,
                     "trace_id": trace_id,
                 },
@@ -215,6 +338,11 @@ async def pubsub_push(request: Request, authorization: str | None = Header(defau
                 extra={
                     "event": "approver_notify_failed",
                     "draft_id": draft_id,
+                    "raw_id": raw_id,
+                    "source": source,
+                    "entity_id": entity_id,
+                    "chat_id": raw.chat_id,
+                    "message_id": raw.message_id,
                     "trace_id": trace_id,
                     "error": str(exc),
                 },
@@ -226,6 +354,8 @@ async def pubsub_push(request: Request, authorization: str | None = Header(defau
             extra={
                 "event": "pubsub_done",
                 "raw_id": raw_id,
+                "source": source,
+                "entity_id": entity_id,
                 "chat_id": chat_id,
                 "source_message_id": source_message_id,
                 "status": "exists",
@@ -239,6 +369,8 @@ async def pubsub_push(request: Request, authorization: str | None = Header(defau
         extra={
             "event": "pubsub_done",
             "raw_id": raw_id,
+            "source": source,
+            "entity_id": entity_id,
             "chat_id": chat_id,
             "source_message_id": source_message_id,
             "status": "created",

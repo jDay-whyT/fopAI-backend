@@ -211,6 +211,15 @@ gcloud logging read `
   --format="table(timestamp,jsonPayload.source,jsonPayload.found,jsonPayload.inserted,jsonPayload.published,jsonPayload.new_offset)"
 ```
 
+Verify ingest source metadata matches the Telegram ingest topic:
+
+```powershell
+gcloud logging read `
+  "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$INGEST_JOB\" AND jsonPayload.event=\"ingest_pubsub_publish\"" `
+  --limit 20 `
+  --format="table(timestamp,jsonPayload.source,jsonPayload.entity_id,jsonPayload.raw_id,jsonPayload.chat_id,jsonPayload.message_id)"
+```
+
 Verify processor handled the Pub/Sub push for the same trace ID:
 
 ```powershell
