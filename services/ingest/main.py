@@ -9,7 +9,7 @@ from typing import Iterable
 
 import google.auth
 from google.cloud import pubsub_v1
-from sqlalchemy import insert, select, update
+from sqlalchemy import select, func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from telethon import TelegramClient
 from telethon.errors import AuthKeyDuplicatedError, BotMethodInvalidError, FloodWaitError
@@ -20,6 +20,7 @@ from shared.logging import configure_logging
 from shared.models import offsets, raw_messages
 from shared.settings import settings
 
+DEFAULT_INGEST_LIMIT = 50
 DEFAULT_MAX_MESSAGES_PER_SOURCE = 50
 DEFAULT_MAX_TOTAL_MESSAGES = 200
 
@@ -96,22 +97,25 @@ def _topic_path(client: pubsub_v1.PublisherClient) -> str:
     return client.topic_path(project_id, settings.pubsub_topic)
 
 
-def _ensure_offset(chat_id: int) -> int:
+def _get_offset(chat_id: int) -> int | None:
     with db_session() as connection:
         existing = connection.execute(select(offsets.c.last_message_id).where(offsets.c.chat_id == chat_id)).fetchone()
         if existing:
             return existing[0]
-        connection.execute(insert(offsets).values(chat_id=chat_id, last_message_id=0))
-        return 0
+    return None
 
 
-def _update_offset(chat_id: int, last_message_id: int) -> None:
+def _upsert_offset(chat_id: int, last_message_id: int) -> None:
     with db_session() as connection:
-        connection.execute(
-            update(offsets)
-            .where(offsets.c.chat_id == chat_id)
-            .values(last_message_id=last_message_id)
+        stmt = (
+            pg_insert(offsets)
+            .values(chat_id=chat_id, last_message_id=last_message_id, updated_at=func.now())
+            .on_conflict_do_update(
+                index_elements=["chat_id"],
+                set_={"last_message_id": last_message_id, "updated_at": func.now()},
+            )
         )
+        connection.execute(stmt)
 
 
 def _insert_raw_messages(messages: Iterable[dict]) -> list[dict[str, int]]:
@@ -145,6 +149,7 @@ async def ingest_once() -> None:
         logger.warning("TG_BOT_TOKEN is set but will be ignored; ingest runs in user mode only.")
     telethon_string_session = _validate_telethon_string_session(settings.telethon_string_session)
     sources = _parse_sources(os.getenv("INGEST_SOURCES"))
+    ingest_limit = _get_env_int("INGEST_LIMIT", DEFAULT_INGEST_LIMIT)
     max_messages_per_source = _get_env_int(
         "INGEST_MAX_MESSAGES_PER_SOURCE",
         DEFAULT_MAX_MESSAGES_PER_SOURCE,
@@ -158,6 +163,7 @@ async def ingest_once() -> None:
         extra={
             "event": "ingest_start",
             "sources": sources,
+            "ingest_limit": ingest_limit,
             "max_messages_per_source": max_messages_per_source,
             "max_total_messages": max_total_messages,
             "cloud_run_job": os.getenv("CLOUD_RUN_JOB"),
@@ -194,7 +200,8 @@ async def ingest_once() -> None:
                     entity = await client.get_entity(source)
                     chat_id = entity.id
                     normalized_source = _normalize_source(source)
-                    last_message_id = _ensure_offset(chat_id)
+                    last_message_id_before = _get_offset(chat_id)
+                    is_first_run = last_message_id_before is None
                     logger.info(
                         "Reading source",
                         extra={
@@ -202,20 +209,29 @@ async def ingest_once() -> None:
                             "entity_id": chat_id,
                             "entity_title": getattr(entity, "title", None),
                             "entity_username": getattr(entity, "username", None),
-                            "last_message_id": last_message_id,
+                            "last_message_id": last_message_id_before,
+                            "is_first_run": is_first_run,
                         },
                     )
 
                     new_messages = []
-                    max_message_id = last_message_id
+                    max_message_id = last_message_id_before or 0
                     per_source_limit = min(max_messages_per_source, remaining_total)
-                    async for message in client.iter_messages(
-                        entity,
-                        min_id=last_message_id,
-                        offset_id=last_message_id,
-                        reverse=True,
-                        limit=per_source_limit,
-                    ):
+                    if is_first_run:
+                        per_source_limit = min(per_source_limit, ingest_limit)
+                        message_iterator = client.iter_messages(
+                            entity,
+                            reverse=True,
+                            limit=per_source_limit,
+                        )
+                    else:
+                        message_iterator = client.iter_messages(
+                            entity,
+                            min_id=last_message_id_before,
+                            reverse=True,
+                            limit=per_source_limit,
+                        )
+                    async for message in message_iterator:
                         if message.id is None:
                             continue
                         max_message_id = max(max_message_id, message.id)
@@ -237,8 +253,8 @@ async def ingest_once() -> None:
                     fetched_count += len(new_messages)
                     inserted_payloads = _insert_raw_messages(new_messages)
                     inserted_count += len(inserted_payloads)
-                    if max_message_id > last_message_id:
-                        _update_offset(chat_id, max_message_id)
+                    if max_message_id > (last_message_id_before or 0):
+                        _upsert_offset(chat_id, max_message_id)
 
                     to_publish_count += len(inserted_payloads)
                     published_for_source = 0
@@ -284,6 +300,9 @@ async def ingest_once() -> None:
                             "event": "ingest_source_summary",
                             "source": normalized_source,
                             "entity_id": chat_id,
+                            "last_message_id_before": last_message_id_before,
+                            "last_message_id_after": max_message_id if max_message_id > 0 else last_message_id_before,
+                            "fetched_count": len(new_messages),
                             "found": len(new_messages),
                             "inserted": len(inserted_payloads),
                             "published": published_for_source,
