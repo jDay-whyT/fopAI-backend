@@ -339,7 +339,7 @@ def _handle_callback(callback: dict) -> dict[str, str]:
         return {"status": "ignored"}
     parsed = _parse_callback_data(data)
     if not parsed:
-        bot.answer_callback(callback_id, "Unknown action")
+        _safe_answer_callback(callback_id, "Unknown action")
         return {"status": "ignored"}
     draft_id, action = parsed
     message = callback.get("message") or {}
@@ -350,29 +350,29 @@ def _handle_callback(callback: dict) -> dict[str, str]:
     if action == "red_ingest":
         logger.info("telegram_callback_action", extra={"action": "RED_INGEST", "draft_id": draft_id})
         _red_ingest(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
-        bot.answer_callback(callback_id, "Moved to review")
+        _safe_answer_callback(callback_id, "Moved to review")
         return {"status": "red_ingest"}
     if action == "skip_ingest":
         logger.info("telegram_callback_action", extra={"action": "SKIP_INGEST", "draft_id": draft_id})
         _skip_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
-        bot.answer_callback(callback_id, "Skipped")
+        _safe_answer_callback(callback_id, "Skipped")
         return {"status": "skipped"}
     if action == "post_review":
         logger.info("telegram_callback_action", extra={"action": "POST_REVIEW", "draft_id": draft_id})
         _post_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
-        bot.answer_callback(callback_id, "Posted")
+        _safe_answer_callback(callback_id, "Posted")
         return {"status": "posted"}
     if action == "red_review":
         logger.info("telegram_callback_action", extra={"action": "RED_REVIEW", "draft_id": draft_id})
         _red_review(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
-        bot.answer_callback(callback_id, "Updated")
+        _safe_answer_callback(callback_id, "Updated")
         return {"status": "red_review"}
     if action == "skip_review":
         logger.info("telegram_callback_action", extra={"action": "SKIP_REVIEW", "draft_id": draft_id})
         _skip_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
-        bot.answer_callback(callback_id, "Skipped")
+        _safe_answer_callback(callback_id, "Skipped")
         return {"status": "skipped"}
-    bot.answer_callback(callback_id, "Unknown action")
+    _safe_answer_callback(callback_id, "Unknown action")
     return {"status": "ignored"}
 
 
@@ -488,7 +488,10 @@ def _post_draft(
             chat_id=publish_channel,
             text=caption,
         )
-        raise
+        return
+    except Exception as exc:  # noqa: BLE001 - log and return to avoid webhook failure
+        logger.warning("telegram_publish_failed", extra={"draft_id": draft_id, "error": str(exc)})
+        return
     published_message_id = response.get("result", {}).get("message_id")
     if published_message_id:
         logger.info(
@@ -585,6 +588,13 @@ def _refresh_review_message(
 
 def _build_callback_data(draft_id: str, action: str) -> str:
     return f"draft:{draft_id}:{action}"
+
+
+def _safe_answer_callback(callback_id: str, text: str) -> None:
+    try:
+        bot.answer_callback(callback_id, text)
+    except Exception as exc:  # noqa: BLE001 - ignore callback failures
+        logger.warning("telegram_callback_answer_failed", extra={"error": str(exc)})
 
 
 def _parse_callback_data(data: str) -> tuple[str, str] | None:

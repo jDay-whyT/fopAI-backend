@@ -1,0 +1,57 @@
+name: Init Firestore
+
+on:
+  workflow_dispatch:
+
+env:
+  REGION: us-central1
+
+jobs:
+  init:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure gcloud project
+        env:
+          PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          gcloud config set project "$PROJECT_ID"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run init_firestore
+        env:
+          WORKSPACE_ID: ${{ vars.WORKSPACE_ID }}
+          WORKSPACE_TITLE: ${{ vars.WORKSPACE_TITLE }}
+          GROUP_CHAT_ID: ${{ vars.GROUP_CHAT_ID }}
+          INGEST_THREAD_ID: ${{ vars.INGEST_THREAD_ID }}
+          REVIEW_THREAD_ID: ${{ vars.REVIEW_THREAD_ID }}
+          PUBLISH_CHANNEL_ID: ${{ vars.PUBLISH_CHANNEL_ID }}
+          GPT_PROFILE: ${{ vars.GPT_PROFILE }}
+          SOURCE_CHATS: ${{ vars.SOURCE_CHATS }}
+        run: |
+          set -euo pipefail
+          python scripts/init_firestore.py

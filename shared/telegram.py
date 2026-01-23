@@ -32,7 +32,7 @@ class TelegramBot:
         text: str,
         reply_markup: dict[str, Any] | None = None,
         message_thread_id: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | bool:
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
         if reply_markup:
             payload["reply_markup"] = json.dumps(reply_markup)
@@ -67,7 +67,20 @@ class TelegramBot:
         message_id: int,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id}
-        return self._post("deleteMessage", payload)
+        try:
+            return self._post("deleteMessage", payload)
+        except TelegramAPIError as exc:
+            if exc.status_code in {400, 403, 404}:
+                logger.warning(
+                    "telegram_delete_ignored",
+                    extra={
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "error": exc.response,
+                    },
+                )
+                return False
+            raise
 
     def safe_delete_message(
         self,
@@ -76,27 +89,18 @@ class TelegramBot:
         *,
         draft_id: str | None = None,
     ) -> dict[str, Any]:
-        try:
-            return self.delete_message(chat_id, message_id)
-        except TelegramAPIError as exc:
-            description = ""
-            if isinstance(exc.response, dict):
-                description = str(exc.response.get("description") or "")
-            if exc.status_code == 400 and (
-                "message to delete not found" in description.lower()
-                or "message can't be deleted" in description.lower()
-            ):
-                logger.warning(
-                    "telegram_delete_ignored",
-                    extra={
-                        "chat_id": chat_id,
-                        "message_id": message_id,
-                        "draft_id": draft_id,
-                        "error": description,
-                    },
-                )
-                return {"ok": False, "ignored": True}
-            raise
+        response = self.delete_message(chat_id, message_id)
+        if response is False:
+            logger.warning(
+                "telegram_delete_ignored",
+                extra={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "draft_id": draft_id,
+                    "error": "ignored",
+                },
+            )
+        return response
 
     def answer_callback(self, callback_query_id: str, text: str) -> dict[str, Any]:
         payload = {"callback_query_id": callback_query_id, "text": text}

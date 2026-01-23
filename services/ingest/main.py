@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from typing import Iterable
 
@@ -75,6 +76,28 @@ def _get_ingest_limit() -> int:
     return value
 
 
+def _get_bootstrap_max_age_seconds() -> int | None:
+    raw_value = os.getenv("BOOTSTRAP_MAX_AGE_DAYS")
+    if raw_value is None or raw_value.strip() == "":
+        return None
+    try:
+        days = int(raw_value)
+    except ValueError as exc:
+        raise RuntimeError("BOOTSTRAP_MAX_AGE_DAYS must be an integer.") from exc
+    if days <= 0:
+        raise RuntimeError("BOOTSTRAP_MAX_AGE_DAYS must be greater than zero.")
+    return days * 86400
+
+
+def _message_has_content(message) -> bool:
+    if message is None:
+        return False
+    text = (message.message or "").strip()
+    if text:
+        return True
+    return getattr(message, "media", None) is not None
+
+
 def _topic_path(client: pubsub_v1.PublisherClient) -> str:
     _, project_id = google.auth.default()
     if not project_id:
@@ -133,6 +156,7 @@ async def ingest_once() -> None:
         logger.warning("TG_BOT_TOKEN is set but will be ignored; ingest runs in user mode only.")
     telethon_string_session = _validate_telethon_string_session(settings.telethon_string_session)
     ingest_limit = _get_ingest_limit()
+    bootstrap_max_age_seconds = _get_bootstrap_max_age_seconds()
     workspace = get_workspace(settings.workspace_id)
     if workspace is None:
         raise RuntimeError(f"workspace {settings.workspace_id} not found in Firestore")
@@ -226,15 +250,30 @@ async def ingest_once() -> None:
                 )
 
                 if not bootstrapped:
-                    newest_messages = await client.get_messages(entity, limit=1)
+                    fetch_limit = max(ingest_limit, 20)
+                    newest_messages = await client.get_messages(entity, limit=fetch_limit)
                     newest = newest_messages[0] if newest_messages else None
-                    if newest and newest.id is not None:
-                        newest_date = _message_unix_timestamp(newest.date)
+                    selected = None
+                    cutoff = None
+                    if bootstrap_max_age_seconds:
+                        cutoff = int(time.time()) - bootstrap_max_age_seconds
+                    for candidate in newest_messages:
+                        if candidate.id is None:
+                            continue
+                        candidate_date = _message_unix_timestamp(candidate.date)
+                        if cutoff and candidate_date and candidate_date < cutoff:
+                            break
+                        if _message_has_content(candidate):
+                            selected = candidate
+                            break
+                    baseline = selected or newest
+                    if baseline and baseline.id is not None:
+                        baseline_date = _message_unix_timestamp(baseline.date)
                         update_source_offsets(
                             settings.workspace_id,
                             source_id,
-                            last_message_id=newest.id,
-                            last_message_date=newest_date,
+                            last_message_id=baseline.id,
+                            last_message_date=baseline_date,
                             bootstrapped=True,
                         )
                         logger.info(
@@ -243,9 +282,15 @@ async def ingest_once() -> None:
                                 "event": "ingest_source_bootstrap",
                                 "source_id": source_id,
                                 "tg_entity": tg_entity,
-                                "last_message_id": newest.id,
-                                "last_message_date": newest_date,
+                                "last_message_id": baseline.id,
+                                "last_message_date": baseline_date,
                                 "message": "bootstrap source, set offset, no publish",
+                                "selected_has_content": bool(selected),
+                                "bootstrap_max_age_days": (
+                                    int(bootstrap_max_age_seconds / 86400)
+                                    if bootstrap_max_age_seconds
+                                    else None
+                                ),
                             },
                         )
                     else:
