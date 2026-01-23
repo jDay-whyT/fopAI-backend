@@ -45,21 +45,37 @@ Required env vars (secrets + non-secrets):
 - `TG_BOT_TOKEN`
 - `WORKSPACE_ID`
 - `APPROVER_NOTIFY_URL`
+- `PUBSUB_TOPIC`
+- `PUBSUB_VERIFICATION_AUDIENCE`
 
 Non-secret env vars:
 
 - `WORKSPACE_ID` (Firestore workspace identifier, e.g. `fop`)
-- `PUBSUB_TOPIC` (`tg-raw-ingested`)
-- `PUBSUB_VERIFICATION_AUDIENCE` (Cloud Run service URL for processor)
-- `APPROVER_NOTIFY_URL` (approver internal notify endpoint URL)
+- `GROUP_CHAT_ID` (Telegram admin group/forum chat ID)
+- `INGEST_THREAD_ID` (forum thread ID for ingest review)
+- `REVIEW_THREAD_ID` (forum thread ID for review)
+- `PUBLISH_CHANNEL_ID` (channel username or ID for publishing)
+- `SOURCE_CHATS` (comma-separated Telegram usernames, e.g. `@channel1,@channel2`)
+- `GPT_PROFILE` (profile name from `GPT_INSTRUCTIONS_JSON`)
 - `INGEST_LIMIT` (optional; default `50`; fallback to `INGEST_MAX_MESSAGES_PER_SOURCE` if still set)
+- `BOOTSTRAP_MAX_AGE_DAYS` (optional; default unset; used only during initial bootstrap)
 - `GPT_INSTRUCTIONS_JSON` (optional map of GPT profile names to system prompts)
 
 For local development, copy `.env.example` to `.env`.
 
+## Production bootstrap (from scratch)
+
+1) Enable the Firestore API in your GCP project.
+2) Deploy Cloud Run services and the ingest job.
+3) Run `scripts/init_firestore.py` once to seed the workspace + sources (safe to re-run; use `--force-reset` to reset offsets).
+4) Start the ingest job (or scheduler) to begin processing new posts.
+
+> You do **not** need to click “Start collection” in the Firestore console; the init script creates the collections.
+
 ## Firestore initialization (workspace + sources)
 
 Use the initialization script once per workspace. It creates/updates the workspace document and seeds source documents.
+Re-running the script is safe: existing offsets are preserved unless you pass `--force-reset`.
 
 Required env vars for the script:
 
@@ -69,9 +85,9 @@ export WORKSPACE_TITLE="FOP"
 export GROUP_CHAT_ID="-1003277785413"
 export INGEST_THREAD_ID="357"
 export REVIEW_THREAD_ID="358"
-export PUBLISH_CHANNEL="@aifopukr"
+export PUBLISH_CHANNEL_ID="@aifopukr"
 export GPT_PROFILE="default"
-export SOURCES="@aifopukr,@nbu_ua,@tax_gov_ua,@verkhovnaradaukrainy,@Minfin_com_ua,@bu911"
+export SOURCE_CHATS="@aifopukr,@nbu_ua,@tax_gov_ua,@verkhovnaradaukrainy,@Minfin_com_ua,@bu911"
 
 python scripts/init_firestore.py
 ```
@@ -83,7 +99,8 @@ Set environment variables on the ingest Cloud Run Job:
 ```bash
 gcloud run jobs update ingest \
   --set-env-vars WORKSPACE_ID="fop" \
-  --set-env-vars INGEST_LIMIT=50
+  --set-env-vars INGEST_LIMIT=50 \
+  --set-env-vars BOOTSTRAP_MAX_AGE_DAYS=30
 ```
 
 ## Ingest health check (quick)
@@ -236,6 +253,15 @@ gcloud logging read `
   --format="table(timestamp,jsonPayload.event,jsonPayload.draft_id,jsonPayload.status)"
 ```
 
+## Firestore smoke check
+
+Verify Firestore connectivity and that the workspace/sources exist:
+
+```bash
+export WORKSPACE_ID="fop"
+python scripts/check_firestore.py
+```
+
 ## Cloud Scheduler
 
 Run the ingest job every 15 minutes:
@@ -258,6 +284,19 @@ Required GitHub secrets:
 - `GCP_PROJECT_ID`
 - `GCP_WORKLOAD_IDENTITY_PROVIDER`
 - `GCP_SERVICE_ACCOUNT`
-- `WORKSPACE_ID` (workspace identifier for Firestore)
+
+Required GitHub variables:
+
+- `WORKSPACE_ID`
+- `WORKSPACE_TITLE`
+- `GROUP_CHAT_ID`
+- `INGEST_THREAD_ID`
+- `REVIEW_THREAD_ID`
+- `PUBLISH_CHANNEL_ID`
+- `GPT_PROFILE`
+- `SOURCE_CHATS`
+- `PUBSUB_VERIFICATION_AUDIENCE`
+- `APPROVER_NOTIFY_URL`
 
 Run the workflow from the Actions tab with the **Deploy** button.
+Use the **Init Firestore** workflow once per workspace (or pass `--force-reset` manually) to seed Firestore.

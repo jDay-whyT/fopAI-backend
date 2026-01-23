@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import re
@@ -31,11 +32,11 @@ def _parse_sources(value: str | None) -> list[tuple[str, str]]:
         if normalized in seen:
             continue
         if not SOURCE_USERNAME_RE.fullmatch(normalized):
-            raise RuntimeError("SOURCES must contain Telegram usernames (letters, numbers, underscores)")
+            raise RuntimeError("SOURCE_CHATS must contain Telegram usernames (letters, numbers, underscores)")
         sources.append((normalized, f"@{normalized}"))
         seen.add(normalized)
     if not sources:
-        raise RuntimeError("SOURCES is required and must list Telegram source usernames")
+        raise RuntimeError("SOURCE_CHATS is required and must list Telegram source usernames")
     return sources
 
 
@@ -46,6 +47,15 @@ def _require_env(name: str) -> str:
     return value.strip()
 
 
+def _require_env_any(*names: str) -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value and value.strip():
+            return value.strip()
+    joined = ", ".join(names)
+    raise RuntimeError(f"One of {joined} is required")
+
+
 def _require_int(name: str) -> int:
     value = _require_env(name)
     try:
@@ -54,16 +64,28 @@ def _require_int(name: str) -> int:
         raise RuntimeError(f"{name} must be an integer") from exc
 
 
+def _resolve_sources_env() -> str | None:
+    return os.getenv("SOURCE_CHATS") or os.getenv("SOURCES")
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    parser = argparse.ArgumentParser(description="Initialize Firestore workspace and sources.")
+    parser.add_argument(
+        "--force-reset",
+        action="store_true",
+        help="Reset source offsets/bootstrapped state. Use with caution.",
+    )
+    args = parser.parse_args()
+
     workspace_id = _require_env("WORKSPACE_ID")
     title = _require_env("WORKSPACE_TITLE")
     tg_group_chat_id = _require_int("GROUP_CHAT_ID")
     ingest_thread_id = _require_int("INGEST_THREAD_ID")
     review_thread_id = _require_int("REVIEW_THREAD_ID")
-    publish_channel = _require_env("PUBLISH_CHANNEL")
+    publish_channel = _require_env_any("PUBLISH_CHANNEL", "PUBLISH_CHANNEL_ID")
     gpt_profile = _require_env("GPT_PROFILE")
-    sources = _parse_sources(os.getenv("SOURCES"))
+    sources = _parse_sources(_resolve_sources_env())
 
     upsert_workspace(
         workspace_id,
@@ -84,27 +106,51 @@ def main() -> None:
             .document(source_id)
         )
         snapshot = doc_ref.get()
-        payload = {
+        base_payload = {
             "tg_entity": tg_entity,
             "enabled": True,
-            "last_message_id": 0,
-            "last_message_date": 0,
-            "bootstrapped": False,
             "updated_at": server_timestamp(),
         }
         if snapshot.exists:
-            doc_ref.update(payload)
+            if args.force_reset:
+                payload = {
+                    **base_payload,
+                    "last_message_id": 0,
+                    "last_message_date": 0,
+                    "bootstrapped": False,
+                }
+                doc_ref.update(payload)
+                logger.info(
+                    "source_forced_reset",
+                    extra={"workspace_id": workspace_id, "source_id": source_id, "tg_entity": tg_entity},
+                )
+            else:
+                doc_ref.update(base_payload)
+                logger.info(
+                    "source_exists",
+                    extra={"workspace_id": workspace_id, "source_id": source_id, "tg_entity": tg_entity},
+                )
         else:
-            payload["created_at"] = server_timestamp()
+            payload = {
+                **base_payload,
+                "last_message_id": 0,
+                "last_message_date": 0,
+                "bootstrapped": False,
+                "created_at": server_timestamp(),
+            }
             doc_ref.set(payload)
-        logger.info(
-            "source_upserted",
-            extra={"workspace_id": workspace_id, "source_id": source_id, "tg_entity": tg_entity},
-        )
+            logger.info(
+                "source_created",
+                extra={"workspace_id": workspace_id, "source_id": source_id, "tg_entity": tg_entity},
+            )
 
     logger.info(
         "workspace_initialized",
-        extra={"workspace_id": workspace_id, "sources_count": len(sources)},
+        extra={
+            "workspace_id": workspace_id,
+            "sources_count": len(sources),
+            "forced_reset": args.force_reset,
+        },
     )
 
 
