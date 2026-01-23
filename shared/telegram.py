@@ -11,6 +11,14 @@ from shared.settings import settings
 logger = logging.getLogger("telegram_bot")
 
 
+class TelegramAPIError(RuntimeError):
+    def __init__(self, method: str, status_code: int, response: Any) -> None:
+        super().__init__(f"Telegram API error {status_code} on {method}")
+        self.method = method
+        self.status_code = status_code
+        self.response = response
+
+
 class TelegramBot:
     def __init__(self, token: str | None = None) -> None:
         self.token = token or settings.tg_bot_token
@@ -61,6 +69,35 @@ class TelegramBot:
         payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id}
         return self._post("deleteMessage", payload)
 
+    def safe_delete_message(
+        self,
+        chat_id: int | str,
+        message_id: int,
+        *,
+        draft_id: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return self.delete_message(chat_id, message_id)
+        except TelegramAPIError as exc:
+            description = ""
+            if isinstance(exc.response, dict):
+                description = str(exc.response.get("description") or "")
+            if exc.status_code == 400 and (
+                "message to delete not found" in description.lower()
+                or "message can't be deleted" in description.lower()
+            ):
+                logger.warning(
+                    "telegram_delete_ignored",
+                    extra={
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "draft_id": draft_id,
+                        "error": description,
+                    },
+                )
+                return {"ok": False, "ignored": True}
+            raise
+
     def answer_callback(self, callback_query_id: str, text: str) -> dict[str, Any]:
         payload = {"callback_query_id": callback_query_id, "text": text}
         return self._post("answerCallbackQuery", payload)
@@ -73,7 +110,7 @@ class TelegramBot:
             raise
         try:
             response.raise_for_status()
-        except requests.HTTPError:
+        except requests.HTTPError as exc:
             response_data: Any
             try:
                 response_data = response.json()
@@ -83,5 +120,5 @@ class TelegramBot:
                 "telegram_api_error",
                 extra={"method": method, "status_code": response.status_code, "response": response_data},
             )
-            raise
+            raise TelegramAPIError(method, response.status_code, response_data) from exc
         return response.json()

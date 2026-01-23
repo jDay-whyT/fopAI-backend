@@ -5,26 +5,30 @@ import logging
 import os
 from typing import Any
 
-try:
-    from telegram.error import TelegramError  # type: ignore
-except Exception:
-    TelegramError = Exception  # fallback
-
 from fastapi import FastAPI, Header, HTTPException, Request
-from sqlalchemy import insert, select, update
 
-from shared.db import db_session
+from shared.firestore import get_draft, get_workspace, update_draft
+from shared.gpt_profiles import get_prompt
 from shared.logging import configure_logging
-from shared.models import draft_posts, published_posts, raw_messages
 from shared.openai_client import get_editor
 from shared.settings import settings
-from shared.telegram import TelegramBot
+from shared.telegram import TelegramAPIError, TelegramBot
 
 logger = logging.getLogger("approver")
 app = FastAPI()
 bot = TelegramBot()
 log_webhook_debug = os.getenv("TELEGRAM_WEBHOOK_LOG_LEVEL", "INFO").upper() == "DEBUG"
-ALLOWED_META_JSON_KEYS = {"ingest_message_id", "review_message_id", "channel_message_id"}
+
+_workspace_cache = None
+
+
+def _get_workspace_required():
+    global _workspace_cache
+    if _workspace_cache is None:
+        _workspace_cache = get_workspace(settings.workspace_id)
+    if _workspace_cache is None:
+        raise RuntimeError(f"workspace {settings.workspace_id} not found in Firestore")
+    return _workspace_cache
 
 
 def summarize_update(update: dict) -> dict[str, Any]:
@@ -57,7 +61,18 @@ def summarize_update(update: dict) -> dict[str, Any]:
 @app.on_event("startup")
 def startup() -> None:
     configure_logging()
-    logger.info("Approver service starting up")
+    workspace = _get_workspace_required()
+    logger.info(
+        "approver_workspace",
+        extra={
+            "event": "approver_workspace",
+            "workspace_id": workspace.id,
+            "tg_group_chat_id": workspace.data.get("tg_group_chat_id"),
+            "ingest_thread_id": workspace.data.get("ingest_thread_id"),
+            "review_thread_id": workspace.data.get("review_thread_id"),
+            "publish_channel": workspace.data.get("publish_channel"),
+        },
+    )
 
 
 @app.get("/healthz")
@@ -70,72 +85,42 @@ async def notify(payload: dict, x_trace_id: str | None = Header(default=None)) -
     draft_id = payload.get("draft_id")
     if not draft_id:
         raise HTTPException(status_code=400, detail="draft_id missing")
-    with db_session() as connection:
-        draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
-        if not draft:
-            raise HTTPException(status_code=404, detail="draft not found")
+    draft = get_draft(settings.workspace_id, str(draft_id))
+    if not draft:
+        raise HTTPException(status_code=404, detail="draft not found")
+    logger.info(
+        "internal_notify_received",
+        extra={
+            "event": "internal_notify_received",
+            "draft_id": draft_id,
+            "status": draft.get("status"),
+            "trace_id": x_trace_id,
+        },
+    )
+    if draft.get("status") != "INGESTED":
+        return {"status": "ignored"}
+    try:
+        _send_ingest_raw_message(draft, trace_id=x_trace_id)
         logger.info(
-            "internal_notify_received",
+            "internal_notify_sent",
             extra={
-                "event": "internal_notify_received",
+                "event": "internal_notify_sent",
                 "draft_id": draft_id,
-                "raw_id": draft.raw_id,
-                "status": draft.status,
+                "status": "ok",
                 "trace_id": x_trace_id,
             },
         )
-        if draft.status != "INGEST":
-            return {"status": "ignored"}
-        raw_message = connection.execute(
-            select(raw_messages).where(raw_messages.c.id == draft.raw_id)
-        ).fetchone()
-        if not raw_message:
-            logger.warning(
-                "draft_raw_message_missing",
-                extra={
-                    "event": "draft_raw_message_missing",
-                    "draft_id": draft_id,
-                    "raw_id": draft.raw_id,
-                    "trace_id": x_trace_id,
-                },
-            )
-        else:
-            raw_meta = dict(raw_message.meta_json or {})
-            source = raw_meta.get("entity_username") or raw_meta.get("source")
-            entity_id = raw_meta.get("entity_id")
-            try:
-                _send_ingest_raw_message(draft, raw_message, x_trace_id)
-                logger.info(
-                    "internal_notify_sent",
-                    extra={
-                        "event": "internal_notify_sent",
-                        "draft_id": draft_id,
-                        "raw_id": draft.raw_id,
-                        "source": source,
-                        "entity_id": entity_id,
-                        "chat_id": raw_message.chat_id,
-                        "message_id": raw_message.message_id,
-                        "status": "ok",
-                        "trace_id": x_trace_id,
-                    },
-                )
-            except Exception as exc:  # noqa: BLE001 - do not fail notify on Telegram errors
-                logger.warning(
-                    "notify_send_failed",
-                    extra={
-                        "event": "notify_send_failed",
-                        "draft_id": draft_id,
-                        "raw_id": draft.raw_id,
-                        "source": source,
-                        "entity_id": entity_id,
-                        "chat_id": raw_message.chat_id,
-                        "message_id": raw_message.message_id,
-                        "status": "failed",
-                        "trace_id": x_trace_id,
-                        "error": str(exc),
-                    },
-                )
-            return {"status": "sent"}
+    except Exception as exc:  # noqa: BLE001 - do not fail notify on Telegram errors
+        logger.warning(
+            "notify_send_failed",
+            extra={
+                "event": "notify_send_failed",
+                "draft_id": draft_id,
+                "status": "failed",
+                "trace_id": x_trace_id,
+                "error": str(exc),
+            },
+        )
     return {"status": "sent"}
 
 
@@ -182,28 +167,46 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
     return {"status": "ignored"}
 
 
-def _send_review_message(draft: Any) -> int | None:
-    if not settings.admin_chat_id:
+def _workspace_config() -> dict[str, Any]:
+    workspace = _get_workspace_required()
+    return workspace.data
+
+
+def _send_review_message(draft: dict[str, Any]) -> int | None:
+    workspace = _workspace_config()
+    admin_chat_id = workspace.get("tg_group_chat_id")
+    review_thread_id = workspace.get("review_thread_id")
+    if not admin_chat_id:
         logger.info("admin_chat_id_missing")
         return None
-    if settings.review_thread_id is None:
+    if review_thread_id is None:
         logger.info("review_thread_id_missing")
-    text = _format_draft_text(draft)
-    keyboard = _build_review_keyboard(draft.id)
+    text = _format_review_text(draft)
+    keyboard = _build_review_keyboard(draft["id"])
     try:
         response = bot.send_message(
-            settings.admin_chat_id,
+            admin_chat_id,
             text,
             reply_markup=keyboard,
-            message_thread_id=settings.review_thread_id,
+            message_thread_id=review_thread_id,
         )
+    except TelegramAPIError as exc:  # noqa: BLE001 - log and continue
+        _log_telegram_bad_request(
+            exc,
+            "send_review_message",
+            draft_id=draft["id"],
+            chat_id=admin_chat_id,
+            message_thread_id=review_thread_id,
+            text=text,
+        )
+        return None
     except Exception as exc:  # noqa: BLE001 - log and continue
         logger.warning(
             "telegram_send_failed",
             extra={
-                "chat_id": settings.admin_chat_id,
-                "thread_id": settings.review_thread_id,
-                "draft_id": draft.id,
+                "chat_id": admin_chat_id,
+                "thread_id": review_thread_id,
+                "draft_id": draft["id"],
                 "error": str(exc),
             },
         )
@@ -214,106 +217,100 @@ def _send_review_message(draft: Any) -> int | None:
         logger.info(
             "telegram_review_message_sent",
             extra={
-                "chat_id": settings.admin_chat_id,
-                "thread_id": settings.review_thread_id,
+                "chat_id": admin_chat_id,
+                "thread_id": review_thread_id,
                 "telegram_message_id": message_id,
-                "draft_id": draft.id,
-                "raw_id": draft.raw_id,
+                "draft_id": draft["id"],
             },
         )
-        _update_draft_meta(draft.id, {"review_message_id": message_id})
+        update_draft(settings.workspace_id, draft["id"], {"review_message_id": message_id})
 
     return message_id
 
 
-def _format_draft_text(draft: Any) -> str:
-    title = html.escape(draft.title or "(no title)")
-    body = html.escape(draft.body or "")
-    header = f"Draft ready for review: {draft.id}"
-    return f"{header}\n\n<b>{title}</b>\n\n{body}".strip()
+def _format_review_text(draft: dict[str, Any]) -> str:
+    red_text = html.escape((draft.get("red_text") or "").strip())
+    header = f"Draft ready for review: {draft['id']}"
+    if not red_text:
+        red_text = html.escape((draft.get("origin_text") or "").strip())
+    return f"{header}\n\n{red_text}".strip()
 
 
-def _format_raw_text(raw_message: Any, draft: Any) -> str:
-    raw_meta = dict(raw_message.meta_json or {})
-    source = raw_meta.get("entity_username") or raw_meta.get("source") or "unknown"
-    source_str = str(source)
+def _format_publish_text(draft: dict[str, Any]) -> str:
+    red_text = (draft.get("red_text") or "").strip()
+    if red_text:
+        return red_text
+    return (draft.get("origin_text") or "").strip()
+
+
+def _format_raw_text(draft: dict[str, Any]) -> str:
+    origin_chat = draft.get("origin_chat") or "unknown"
+    origin_message_id = draft.get("origin_message_id") or "unknown"
+    origin_message_date = draft.get("origin_message_date") or 0
+    source_str = str(origin_chat)
     if source_str and not source_str.startswith("@"):
         source_str = f"@{source_str}"
-    entity_title = raw_meta.get("entity_title") or ""
-    entity_id = raw_meta.get("entity_id") or "unknown"
-    header_parts = [f"Source: {source_str}"]
-    if entity_title:
-        header_parts.append(str(entity_title))
-    header_parts.append(f"entity_id={entity_id}")
-    header = " | ".join(header_parts)
-    ids_line = (
-        f"raw_id={draft.raw_id} chat_id={raw_message.chat_id} msg_id={raw_message.message_id}"
-    )
-    raw_text = (raw_message.text or "").strip()
+    header = f"Source: {source_str}"
+    ids_line = f"origin_message_id={origin_message_id} date={origin_message_date}"
+    raw_text = (draft.get("origin_text") or "").strip()
     preview = html.escape(raw_text[:800])
     return f"{header}\n{ids_line}\n\n{preview}".strip()
 
 
-def _has_text(raw_message: Any) -> bool:
-    return bool((raw_message.text or "").strip())
-
-
-def _send_ingest_raw_message(draft: Any, raw_message: Any, trace_id: str | None) -> None:
-    if not settings.admin_chat_id:
+def _send_ingest_raw_message(draft: dict[str, Any], trace_id: str | None) -> None:
+    workspace = _workspace_config()
+    admin_chat_id = workspace.get("tg_group_chat_id")
+    ingest_thread_id = workspace.get("ingest_thread_id")
+    if not admin_chat_id:
         logger.info("admin_chat_id_missing")
         return
-    if settings.ingest_thread_id is None:
+    if ingest_thread_id is None:
         logger.info("ingest_thread_id_missing")
-    raw_meta = dict(raw_message.meta_json or {})
-    source = raw_meta.get("entity_username") or raw_meta.get("source")
-    entity_id = raw_meta.get("entity_id")
-    if not _has_text(raw_message):
+    if not (draft.get("origin_text") or "").strip():
         logger.info(
             "approver_skip_empty_text",
             extra={
                 "event": "approver_skip_empty_text",
-                "draft_id": draft.id,
-                "raw_id": draft.raw_id,
-                "source": source,
-                "entity_id": entity_id,
-                "chat_id": raw_message.chat_id,
-                "message_id": raw_message.message_id,
+                "draft_id": draft["id"],
                 "trace_id": trace_id,
             },
         )
-        with db_session() as connection:
-            connection.execute(
-                update(draft_posts)
-                .where(draft_posts.c.id == draft.id)
-                .values(status="SKIPPED", reason="empty_text")
-            )
+        update_draft(settings.workspace_id, draft["id"], {"status": "SKIPPED"})
         return
-    text = _format_raw_text(raw_message, draft)
+    text = _format_raw_text(draft)
     keyboard = {
         "inline_keyboard": [
             [
-                {"text": "RED", "callback_data": _build_callback_data(draft.id, "red_ingest")},
-                {"text": "SKIP", "callback_data": _build_callback_data(draft.id, "skip_ingest")},
+                {"text": "RED", "callback_data": _build_callback_data(draft["id"], "red_ingest")},
+                {"text": "SKIP", "callback_data": _build_callback_data(draft["id"], "skip_ingest")},
             ]
         ]
     }
     try:
         response = bot.send_message(
-            settings.admin_chat_id,
+            admin_chat_id,
             text,
             reply_markup=keyboard,
-            message_thread_id=settings.ingest_thread_id,
+            message_thread_id=ingest_thread_id,
         )
+    except TelegramAPIError as exc:  # noqa: BLE001 - log and continue
+        _log_telegram_bad_request(
+            exc,
+            "send_ingest_raw_message",
+            draft_id=draft["id"],
+            chat_id=admin_chat_id,
+            message_thread_id=ingest_thread_id,
+            text=text,
+            trace_id=trace_id,
+        )
+        return
     except Exception as exc:  # noqa: BLE001 - log and continue
         logger.warning(
             "telegram_send_failed",
             extra={
-                "chat_id": settings.admin_chat_id,
-                "thread_id": settings.ingest_thread_id,
-                "draft_id": draft.id,
-                "raw_id": draft.raw_id,
-                "source": source,
-                "entity_id": entity_id,
+                "chat_id": admin_chat_id,
+                "thread_id": ingest_thread_id,
+                "draft_id": draft["id"],
                 "trace_id": trace_id,
                 "error": str(exc),
             },
@@ -324,17 +321,14 @@ def _send_ingest_raw_message(draft: Any, raw_message: Any, trace_id: str | None)
         logger.info(
             "telegram_ingest_raw_message_sent",
             extra={
-                "chat_id": settings.admin_chat_id,
-                "thread_id": settings.ingest_thread_id,
+                "chat_id": admin_chat_id,
+                "thread_id": ingest_thread_id,
                 "telegram_message_id": message_id,
-                "draft_id": draft.id,
-                "raw_id": draft.raw_id,
-                "source": source,
-                "entity_id": entity_id,
+                "draft_id": draft["id"],
                 "trace_id": trace_id,
             },
         )
-        _update_draft_meta(draft.id, {"ingest_message_id": message_id})
+        update_draft(settings.workspace_id, draft["id"], {"ingest_message_id": message_id})
 
 
 def _handle_callback(callback: dict) -> dict[str, str]:
@@ -353,9 +347,6 @@ def _handle_callback(callback: dict) -> dict[str, str]:
     chat_id = (message.get("chat") or {}).get("id")
     message_thread_id = message.get("message_thread_id")
 
-    if action == "take":
-        bot.answer_callback(callback_id, "Unknown action")
-        return {"status": "ignored"}
     if action == "red_ingest":
         logger.info("telegram_callback_action", extra={"action": "RED_INGEST", "draft_id": draft_id})
         _red_ingest(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
@@ -366,12 +357,6 @@ def _handle_callback(callback: dict) -> dict[str, str]:
         _skip_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
         bot.answer_callback(callback_id, "Skipped")
         return {"status": "skipped"}
-    if action == "skip":
-        bot.answer_callback(callback_id, "Unknown action")
-        return {"status": "ignored"}
-    if action == "post":
-        bot.answer_callback(callback_id, "Unknown action")
-        return {"status": "ignored"}
     if action == "post_review":
         logger.info("telegram_callback_action", extra={"action": "POST_REVIEW", "draft_id": draft_id})
         _post_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
@@ -387,11 +372,6 @@ def _handle_callback(callback: dict) -> dict[str, str]:
         _skip_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
         bot.answer_callback(callback_id, "Skipped")
         return {"status": "skipped"}
-    if action == "edit":
-        logger.info("telegram_callback_action", extra={"action": "EDIT", "draft_id": draft_id})
-        _edit_draft(draft_id, message_id=message_id, chat_id=chat_id, message_thread_id=message_thread_id)
-        bot.answer_callback(callback_id, "Edited")
-        return {"status": "edited"}
     bot.answer_callback(callback_id, "Unknown action")
     return {"status": "ignored"}
 
@@ -407,40 +387,31 @@ def _handle_message(message: dict) -> dict[str, str]:
     if len(header_parts) < 2:
         logger.warning("telegram_edit_missing_draft_id")
         return {"status": "ignored"}
-    draft_id_str = header_parts[1]
+    draft_id = header_parts[1]
     rest = header_parts[2:]
-    try:
-        draft_id = int(draft_id_str)
-    except ValueError:
-        logger.warning("telegram_edit_invalid_draft_id", extra={"draft_id": draft_id_str})
-        return {"status": "ignored"}
     if rest:
         body_text = " ".join(rest) + ("\n" + body_text if body_text else "")
-    title, body = _parse_title_body(body_text)
-    with db_session() as connection:
-        connection.execute(
-            update(draft_posts)
-            .where(draft_posts.c.id == draft_id)
-            .values(title=title, body=body, status="REVIEW")
-        )
-        draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
+    red_text = body_text.strip()
+    if not red_text:
+        logger.warning("telegram_edit_empty_body", extra={"draft_id": draft_id})
+        return {"status": "ignored"}
+    update_draft(settings.workspace_id, draft_id, {"red_text": red_text, "status": "RED_READY"})
+    draft = get_draft(settings.workspace_id, draft_id)
     if draft:
-        _send_review_message(draft)
+        _refresh_review_message(draft, chat_id=message.get("chat", {}).get("id"), message_id=message.get("message_id"))
     return {"status": "edited"}
 
 
-def _parse_title_body(text: str) -> tuple[str, str]:
-    if "\n\n" in text:
-        title, body = text.split("\n\n", 1)
-    else:
-        lines = text.split("\n", 1)
-        title = lines[0] if lines else ""
-        body = lines[1] if len(lines) > 1 else ""
-    return title.strip(), body.strip()
+def _build_red_text(summary: dict[str, Any], fallback: str) -> str:
+    title = (summary.get("title") or "").strip()
+    body = (summary.get("body") or "").strip()
+    if title and body:
+        return f"{title}\n\n{body}".strip()
+    return (title or body or fallback).strip()
 
 
 def _red_ingest(
-    draft_id: int,
+    draft_id: str,
     message_id: int | None,
     chat_id: int | None,
     message_thread_id: int | None,
@@ -448,126 +419,94 @@ def _red_ingest(
     editor = get_editor()
     if editor is None:
         raise HTTPException(status_code=503, detail="OpenAI client unavailable")
-    with db_session() as connection:
-        draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
-        if not draft:
-            raise HTTPException(status_code=404, detail="draft not found")
-        raw_message = connection.execute(
-            select(raw_messages).where(raw_messages.c.id == draft.raw_id)
-        ).fetchone()
-        if not raw_message:
-            raise HTTPException(status_code=404, detail="raw message not found")
+    draft = get_draft(settings.workspace_id, draft_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="draft not found")
+    origin_text = (draft.get("origin_text") or "").strip()
+    if not origin_text:
+        update_draft(settings.workspace_id, draft_id, {"status": "SKIPPED"})
+        return
+    workspace = _workspace_config()
+    prompt = get_prompt(workspace.get("gpt_profile"))
     try:
-        summary = editor.summarize(raw_message.text or "")
+        summary = editor.summarize(origin_text, system_prompt=prompt)
     except Exception as exc:  # noqa: BLE001 - OpenAI errors should mark failed
-        with db_session() as connection:
-            connection.execute(
-                update(draft_posts).where(draft_posts.c.id == draft_id).values(status="FAILED")
-            )
+        update_draft(settings.workspace_id, draft_id, {"status": "SKIPPED"})
         logger.warning("openai_summarize_failed", extra={"draft_id": draft_id, "error": str(exc)})
         raise HTTPException(status_code=502, detail="OpenAI summarization failed") from exc
-    with db_session() as connection:
-        connection.execute(
-            update(draft_posts)
-            .where(draft_posts.c.id == draft_id)
-            .values(
-                title=summary.get("title"),
-                body=summary.get("body"),
-                image_prompt=summary.get("image_prompt"),
-                model=summary.get("_model"),
-                tokens=summary.get("_tokens"),
-                status="REVIEW",
-            )
-        )
-        draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
+    if summary.get("skip") is True:
+        update_draft(settings.workspace_id, draft_id, {"status": "SKIPPED"})
+        return
+    red_text = _build_red_text(summary, origin_text)
+    update_draft(settings.workspace_id, draft_id, {"red_text": red_text, "status": "RED_READY"})
+    draft = get_draft(settings.workspace_id, draft_id)
     if draft:
         review_message_id = _send_review_message(draft)
         if review_message_id:
-            _update_draft_meta(draft.id, {"review_message_id": review_message_id})
+            update_draft(settings.workspace_id, draft_id, {"review_message_id": review_message_id})
     if chat_id and message_id:
-        try:
-            bot.delete_message(chat_id, message_id)
-        except Exception as exc:  # noqa: BLE001 - do not fail webhook
-            logger.warning(
-                "telegram_delete_failed",
-                extra={"draft_id": draft_id, "chat_id": chat_id, "message_id": message_id, "error": str(exc)},
-            )
+        bot.safe_delete_message(chat_id, message_id, draft_id=draft_id)
 
 
 def _skip_draft(
-    draft_id: int,
+    draft_id: str,
     message_id: int | None,
     chat_id: int | None,
     message_thread_id: int | None,
 ) -> None:
-    with db_session() as connection:
-        connection.execute(update(draft_posts).where(draft_posts.c.id == draft_id).values(status="SKIPPED"))
+    update_draft(settings.workspace_id, draft_id, {"status": "SKIPPED"})
     if chat_id and message_id:
-        try:
-            bot.delete_message(chat_id, message_id)
-        except Exception as exc:  # noqa: BLE001 - do not fail webhook
-            logger.warning(
-                "telegram_delete_failed",
-                extra={"draft_id": draft_id, "chat_id": chat_id, "message_id": message_id, "error": str(exc)},
-            )
+        bot.safe_delete_message(chat_id, message_id, draft_id=draft_id)
 
 
 def _post_draft(
-    draft_id: int,
+    draft_id: str,
     message_id: int | None,
     chat_id: int | None,
     message_thread_id: int | None,
 ) -> None:
-    with db_session() as connection:
-        draft = connection.execute(
-            select(draft_posts).where(draft_posts.c.id == draft_id).with_for_update()
-        ).fetchone()
-        if not draft:
-            raise HTTPException(status_code=404, detail="draft not found")
-        if draft.status == "PUBLISHED":
-            return
-        if draft.status not in {"REVIEW"}:
-            raise HTTPException(status_code=400, detail="draft not publishable")
+    draft = get_draft(settings.workspace_id, draft_id)
+    if not draft:
+        raise HTTPException(status_code=404, detail="draft not found")
+    if draft.get("status") == "POSTED":
+        return
+    if draft.get("status") not in {"RED_READY"}:
+        raise HTTPException(status_code=400, detail="draft not publishable")
 
-        if not settings.target_channel_username:
-            raise HTTPException(status_code=400, detail="target channel missing")
-        caption = _format_draft_text(draft)
-        response = bot.send_message(settings.target_channel_username, caption)
-        published_message_id = response.get("result", {}).get("message_id")
-        if published_message_id:
-            logger.info(
-                "telegram_publish_success",
-                extra={
-                    "channel_username": settings.target_channel_username,
-                    "channel_id": settings.target_channel_id,
-                    "channel_message_id": published_message_id,
-                    "draft_id": draft_id,
-                },
-            )
+    workspace = _workspace_config()
+    publish_channel = workspace.get("publish_channel")
+    if not publish_channel:
+        raise HTTPException(status_code=400, detail="publish channel missing")
+    caption = _format_publish_text(draft)
+    try:
+        response = bot.send_message(publish_channel, caption)
+    except TelegramAPIError as exc:
+        _log_telegram_bad_request(
+            exc,
+            "publish",
+            draft_id=draft_id,
+            chat_id=publish_channel,
+            text=caption,
+        )
+        raise
+    published_message_id = response.get("result", {}).get("message_id")
+    if published_message_id:
+        logger.info(
+            "telegram_publish_success",
+            extra={
+                "channel": publish_channel,
+                "channel_message_id": published_message_id,
+                "draft_id": draft_id,
+            },
+        )
 
-        connection.execute(
-            update(draft_posts).where(draft_posts.c.id == draft_id).values(status="PUBLISHED")
-        )
-        target_chat_id = settings.target_channel_id or settings.admin_chat_id or 0
-        connection.execute(
-            insert(published_posts).values(
-                draft_id=draft_id,
-                target_chat_id=target_chat_id,
-                channel_message_id=published_message_id,
-            )
-        )
+    update_draft(settings.workspace_id, draft_id, {"status": "POSTED"})
     if chat_id and message_id:
-        try:
-            bot.delete_message(chat_id, message_id)
-        except Exception as exc:  # noqa: BLE001 - do not fail webhook
-            logger.warning(
-                "telegram_delete_failed",
-                extra={"draft_id": draft_id, "chat_id": chat_id, "message_id": message_id, "error": str(exc)},
-            )
+        bot.safe_delete_message(chat_id, message_id, draft_id=draft_id)
 
 
 def _red_review(
-    draft_id: int,
+    draft_id: str,
     message_id: int | None,
     chat_id: int | None,
     message_thread_id: int | None,
@@ -575,92 +514,32 @@ def _red_review(
     editor = get_editor()
     if editor is None:
         raise HTTPException(status_code=503, detail="OpenAI client unavailable")
-    with db_session() as connection:
-        draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
-        if not draft:
-            raise HTTPException(status_code=404, detail="draft not found")
-    input_text = _format_edit_input(draft)
-    try:
-        summary = editor.summarize(input_text)
-    except Exception as exc:  # noqa: BLE001 - OpenAI errors should mark failed
-        with db_session() as connection:
-            connection.execute(
-                update(draft_posts).where(draft_posts.c.id == draft_id).values(status="FAILED")
-            )
-        logger.warning("openai_summarize_failed", extra={"draft_id": draft_id, "error": str(exc)})
-        raise HTTPException(status_code=502, detail="OpenAI summarization failed") from exc
-    with db_session() as connection:
-        connection.execute(
-            update(draft_posts)
-            .where(draft_posts.c.id == draft_id)
-            .values(
-                title=summary.get("title"),
-                body=summary.get("body"),
-                image_prompt=summary.get("image_prompt"),
-                model=summary.get("_model"),
-                tokens=summary.get("_tokens"),
-                status="REVIEW",
-            )
-        )
-        draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
-    if draft:
-        _refresh_review_message(draft, chat_id=chat_id, message_id=message_id, message_thread_id=message_thread_id)
-
-
-def _edit_draft(
-    draft_id: int,
-    message_id: int | None,
-    chat_id: int | None,
-    message_thread_id: int | None,
-) -> None:
-    editor = get_editor()
-    if editor is None:
-        raise HTTPException(status_code=503, detail="OpenAI client unavailable")
-
-    with db_session() as connection:
-        draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
-        if not draft:
-            raise HTTPException(status_code=404, detail="draft not found")
-
-    input_text = _format_edit_input(draft)
-    try:
-        summary = editor.summarize(input_text)
-    except Exception as exc:  # noqa: BLE001 - OpenAI errors should mark failed
-        with db_session() as connection:
-            connection.execute(
-                update(draft_posts).where(draft_posts.c.id == draft_id).values(status="FAILED")
-            )
-        logger.warning("openai_summarize_failed", extra={"draft_id": draft_id, "error": str(exc)})
-        raise HTTPException(status_code=502, detail="OpenAI summarization failed") from exc
-    with db_session() as connection:
-        connection.execute(
-            update(draft_posts)
-            .where(draft_posts.c.id == draft_id)
-            .values(
-                title=summary.get("title"),
-                body=summary.get("body"),
-                image_prompt=summary.get("image_prompt"),
-                model=summary.get("_model"),
-                tokens=summary.get("_tokens"),
-                status="REVIEW",
-            )
-        )
-        draft = connection.execute(select(draft_posts).where(draft_posts.c.id == draft_id)).fetchone()
-
+    draft = get_draft(settings.workspace_id, draft_id)
     if not draft:
+        raise HTTPException(status_code=404, detail="draft not found")
+    origin_text = (draft.get("origin_text") or "").strip()
+    context_text = origin_text
+    if draft.get("red_text"):
+        context_text = f"{origin_text}\n\nPrevious redaction:\n{draft.get('red_text')}"
+    workspace = _workspace_config()
+    prompt = get_prompt(workspace.get("gpt_profile"))
+    try:
+        summary = editor.summarize(context_text, system_prompt=prompt)
+    except Exception as exc:  # noqa: BLE001 - OpenAI errors should mark failed
+        update_draft(settings.workspace_id, draft_id, {"status": "SKIPPED"})
+        logger.warning("openai_summarize_failed", extra={"draft_id": draft_id, "error": str(exc)})
+        raise HTTPException(status_code=502, detail="OpenAI summarization failed") from exc
+    if summary.get("skip") is True:
+        update_draft(settings.workspace_id, draft_id, {"status": "SKIPPED"})
         return
-    _refresh_review_message(draft, chat_id=chat_id, message_id=message_id, message_thread_id=message_thread_id)
+    red_text = _build_red_text(summary, origin_text)
+    update_draft(settings.workspace_id, draft_id, {"red_text": red_text, "status": "RED_READY"})
+    draft = get_draft(settings.workspace_id, draft_id)
+    if draft:
+        _refresh_review_message(draft, chat_id=chat_id, message_id=message_id)
 
 
-def _format_edit_input(draft: Any) -> str:
-    title = (draft.title or "").strip()
-    body = (draft.body or "").strip()
-    if title and body:
-        return f"{title}\n\n{body}"
-    return title or body
-
-
-def _build_review_keyboard(draft_id: int) -> dict[str, Any]:
+def _build_review_keyboard(draft_id: str) -> dict[str, Any]:
     return {
         "inline_keyboard": [
             [
@@ -673,13 +552,12 @@ def _build_review_keyboard(draft_id: int) -> dict[str, Any]:
 
 
 def _refresh_review_message(
-    draft: Any,
+    draft: dict[str, Any],
     chat_id: int | None,
     message_id: int | None,
-    message_thread_id: int | None,
 ) -> None:
-    text = _format_draft_text(draft)
-    keyboard = _build_review_keyboard(draft.id)
+    text = _format_review_text(draft)
+    keyboard = _build_review_keyboard(draft["id"])
     if chat_id and message_id:
         try:
             bot.edit_message_text(
@@ -689,47 +567,56 @@ def _refresh_review_message(
                 reply_markup=keyboard,
             )
             return
+        except TelegramAPIError as exc:  # noqa: BLE001 - fallback to new message
+            _log_telegram_bad_request(
+                exc,
+                "edit_review_message",
+                draft_id=draft["id"],
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+            )
         except Exception as exc:  # noqa: BLE001 - fallback to new message
-            logger.warning("telegram_edit_failed", extra={"draft_id": draft.id, "error": str(exc)})
+            logger.warning("telegram_edit_failed", extra={"draft_id": draft["id"], "error": str(exc)})
     review_message_id = _send_review_message(draft)
     if review_message_id:
-        _update_draft_meta(draft.id, {"review_message_id": review_message_id})
+        update_draft(settings.workspace_id, draft["id"], {"review_message_id": review_message_id})
 
 
-def _build_callback_data(draft_id: int, action: str) -> str:
+def _build_callback_data(draft_id: str, action: str) -> str:
     return f"draft:{draft_id}:{action}"
 
 
-def _parse_callback_data(data: str) -> tuple[int, str] | None:
+def _parse_callback_data(data: str) -> tuple[str, str] | None:
     parts = data.split(":", 2)
     if len(parts) != 3 or parts[0] != "draft":
         return None
-    try:
-        draft_id = int(parts[1])
-    except ValueError:
-        return None
-    return draft_id, parts[2]
+    return parts[1], parts[2]
 
 
-def _update_draft_meta(draft_id: int, updates: dict[str, Any]) -> None:
-    allowed_updates = {key: value for key, value in updates.items() if key in ALLOWED_META_JSON_KEYS}
-    if not allowed_updates:
+def _log_telegram_bad_request(
+    exc: TelegramAPIError,
+    action: str,
+    *,
+    draft_id: str,
+    chat_id: int | str | None,
+    message_thread_id: int | None = None,
+    message_id: int | None = None,
+    text: str | None = None,
+    trace_id: str | None = None,
+) -> None:
+    if exc.status_code != 400:
         return
-    with db_session() as connection:
-        raw_id = connection.execute(
-            select(draft_posts.c.raw_id).where(draft_posts.c.id == draft_id)
-        ).scalar_one_or_none()
-        if not raw_id:
-            logger.warning("draft_raw_id_missing", extra={"draft_id": draft_id})
-            return
-        raw_row = connection.execute(
-            select(raw_messages.c.id, raw_messages.c.meta_json).where(raw_messages.c.id == raw_id)
-        ).fetchone()
-        if not raw_row:
-            logger.warning("raw_message_missing", extra={"draft_id": draft_id, "raw_id": raw_id})
-            return
-        current = dict(raw_row.meta_json or {})
-        current.update(allowed_updates)
-        connection.execute(
-            update(raw_messages).where(raw_messages.c.id == raw_id).values(meta_json=current)
-        )
+    logger.warning(
+        "telegram_bad_request",
+        extra={
+            "action": action,
+            "draft_id": draft_id,
+            "chat_id": chat_id,
+            "message_thread_id": message_thread_id,
+            "message_id": message_id,
+            "text_preview": (text or "")[:200],
+            "trace_id": trace_id,
+            "response": exc.response,
+        },
+    )

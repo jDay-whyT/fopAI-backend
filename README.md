@@ -4,10 +4,10 @@ This repo contains a Telegram news pipeline on GCP with MTProto ingest, GPT proc
 
 ## Architecture
 
-- **Ingest (Cloud Run Job)**: Telethon user-client reads sources, stores raw messages, publishes to Pub/Sub.
-- **Processor (Cloud Run Service)**: Pub/Sub push handler produces draft posts via OpenAI.
-- **Approver (Cloud Run Service)**: Telegram bot webhook for review/approve/edit/reject.
-- **PostgreSQL (Cloud SQL)**: Persistent storage.
+- **Ingest (Cloud Run Job)**: Telethon user-client reads sources, stores offsets in Firestore, publishes to Pub/Sub.
+- **Processor (Cloud Run Service)**: Pub/Sub push handler creates draft posts in Firestore.
+- **Approver (Cloud Run Service)**: Telegram bot webhook for review/approve/reject and GPT redrafting.
+- **Firestore (Native)**: Persistent storage for workspaces, sources, and drafts.
 
 ## Components & flow
 
@@ -16,8 +16,7 @@ Ingest -> Pub/Sub -> Processor -> Approver -> Channel
 ## GCP fixed values
 
 - Region: `us-central1`
-- Cloud SQL instance connection: `optimum-tea-481710-u3:us-central1:fopai-postgres`
-- DB name: `fopai`
+- Firestore: `(default)` database in `nam5` (Native mode)
 
 ## Required APIs
 
@@ -25,7 +24,7 @@ Enable these APIs in your GCP project (one-time manual setup; CI will only check
 
 - Cloud Run
 - Artifact Registry
-- Cloud SQL Admin API
+- Firestore
 - Secret Manager
 - Cloud Scheduler
 - Pub/Sub
@@ -34,8 +33,6 @@ Enable these APIs in your GCP project (one-time manual setup; CI will only check
 ## Secrets and environment variables
 
 Create these secrets in Secret Manager (values omitted):
-
-- `DB_PASSWORD`
 - `TELEGRAM_API_ID`
 - `TELEGRAM_API_HASH`
 - `TELETHON_STRING_SESSION`
@@ -44,58 +41,50 @@ Create these secrets in Secret Manager (values omitted):
 
 Required env vars (secrets + non-secrets):
 
-- `DB_PASSWORD`
 - `OPENAI_API_KEY`
 - `TG_BOT_TOKEN`
-- `ADMIN_CHAT_ID`
-- `TARGET_CHANNEL_ID` or `TARGET_CHANNEL_USERNAME`
-- `INGEST_THREAD_ID`
-- `REVIEW_THREAD_ID`
+- `WORKSPACE_ID`
 - `APPROVER_NOTIFY_URL`
 
 Non-secret env vars:
 
-- `DB_INSTANCE_CONNECTION_NAME` (fixed value above)
-- `DB_NAME` (fixed value above)
-- `DB_USER` (defaults to `postgres`)
-- `ADMIN_CHAT_ID` (required for review notifications)
-- `TARGET_CHANNEL_ID` (optional; defaults to admin chat)
-- `TARGET_CHANNEL_USERNAME` (optional; defaults to admin chat)
-- `INGEST_THREAD_ID` (thread to post new drafts in admin chat)
-- `REVIEW_THREAD_ID` (thread to post review messages in admin chat)
+- `WORKSPACE_ID` (Firestore workspace identifier, e.g. `fop`)
 - `PUBSUB_TOPIC` (`tg-raw-ingested`)
 - `PUBSUB_VERIFICATION_AUDIENCE` (Cloud Run service URL for processor)
 - `APPROVER_NOTIFY_URL` (approver internal notify endpoint URL)
-- `INGEST_SOURCES` (comma-separated Telegram source usernames or numeric IDs)
 - `INGEST_LIMIT` (optional; default `50`; fallback to `INGEST_MAX_MESSAGES_PER_SOURCE` if still set)
+- `GPT_INSTRUCTIONS_JSON` (optional map of GPT profile names to system prompts)
 
 For local development, copy `.env.example` to `.env`.
 
-## Ingest sources and limits (Cloud Run Job)
+## Firestore initialization (workspace + sources)
 
-Configure ingest sources explicitly to avoid reading unintended channels. The job will fail fast if `INGEST_SOURCES` is empty.
+Use the initialization script once per workspace. It creates/updates the workspace document and seeds source documents.
+
+Required env vars for the script:
+
+```bash
+export WORKSPACE_ID="fop"
+export WORKSPACE_TITLE="FOP"
+export GROUP_CHAT_ID="-1003277785413"
+export INGEST_THREAD_ID="357"
+export REVIEW_THREAD_ID="358"
+export PUBLISH_CHANNEL="@aifopukr"
+export GPT_PROFILE="default"
+export SOURCES="@aifopukr,@nbu_ua,@tax_gov_ua,@verkhovnaradaukrainy,@Minfin_com_ua,@bu911"
+
+python scripts/init_firestore.py
+```
+
+## Ingest limits (Cloud Run Job)
 
 Set environment variables on the ingest Cloud Run Job:
 
 ```bash
 gcloud run jobs update ingest \
-  --set-env-vars INGEST_SOURCES="@Minfin_com_ua,verkhovnaradaukrainy,123456789" \
+  --set-env-vars WORKSPACE_ID="fop" \
   --set-env-vars INGEST_LIMIT=50
 ```
-
-Example configurations:
-
-- Single channel by username:
-  ```bash
-  gcloud run jobs update ingest \
-    --set-env-vars INGEST_SOURCES="@tax_gov_ua"
-  ```
-- Multiple sources with numeric IDs and tighter limits:
-  ```bash
-  gcloud run jobs update ingest \
-    --set-env-vars INGEST_SOURCES="@nbu_ua,987654321" \
-    --set-env-vars INGEST_LIMIT=20
-  ```
 
 ## Ingest health check (quick)
 
@@ -113,10 +102,10 @@ EXECUTION_NAME="ingest-00000-abc"
 gcloud logging read \
   "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"ingest\" AND resource.labels.execution_name=\"$EXECUTION_NAME\" AND jsonPayload.event=\"ingest_source_state\"" \
   --limit 50 \
-  --format="table(timestamp,jsonPayload.source,jsonPayload.entity_username,jsonPayload.entity_title,jsonPayload.fetched_count,jsonPayload.inserted_count,jsonPayload.published_count,jsonPayload.last_message_id_before,jsonPayload.last_message_id_after)"
+  --format="table(timestamp,jsonPayload.source_id,jsonPayload.fetched_count,jsonPayload.published_count,jsonPayload.last_message_id_before,jsonPayload.last_message_id_after)"
 ```
 
-3) Verify sources are the intended ones (same log line above shows `entity_username`, `entity_title`, and `entity_id/chat_id`).
+3) Verify sources are the intended ones (same log line above shows `source_id` and offsets).
 
 ## Secrets bootstrap
 
@@ -131,17 +120,6 @@ Verify what exists with:
 ```bash
 gcloud secrets list
 ```
-
-## Database migrations
-
-Migrations use Alembic and require `DATABASE_URL`.
-
-```bash
-export DATABASE_URL="postgresql+pg8000://USER:PASSWORD@HOST:5432/fopai"
-alembic upgrade head
-```
-
-Recommended production flow: run migrations as a one-off Cloud Run Job or locally via the Cloud SQL Auth Proxy.
 
 ## Pub/Sub setup
 
@@ -228,7 +206,7 @@ Verify ingest source summary and publish counts:
 gcloud logging read `
   "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$INGEST_JOB\" AND jsonPayload.event=\"ingest_source_state\"" `
   --limit 50 `
-  --format="table(timestamp,jsonPayload.source,jsonPayload.fetched_count,jsonPayload.inserted_count,jsonPayload.published_count,jsonPayload.last_message_id_after)"
+  --format="table(timestamp,jsonPayload.source_id,jsonPayload.fetched_count,jsonPayload.published_count,jsonPayload.last_message_id_after)"
 ```
 
 Verify ingest source metadata matches the Telegram ingest topic:
@@ -237,7 +215,7 @@ Verify ingest source metadata matches the Telegram ingest topic:
 gcloud logging read `
   "resource.type=\"cloud_run_job\" AND resource.labels.job_name=\"$INGEST_JOB\" AND jsonPayload.event=\"ingest_pubsub_publish\"" `
   --limit 20 `
-  --format="table(timestamp,jsonPayload.source,jsonPayload.entity_id,jsonPayload.raw_id,jsonPayload.chat_id,jsonPayload.message_id)"
+  --format="table(timestamp,jsonPayload.source_id,jsonPayload.origin_message_id,jsonPayload.message_id)"
 ```
 
 Verify processor handled the Pub/Sub push for the same trace ID:
@@ -246,7 +224,7 @@ Verify processor handled the Pub/Sub push for the same trace ID:
 gcloud logging read `
   "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"$PROCESSOR_SERVICE\" AND jsonPayload.trace_id=\"$TRACE_ID\"" `
   --limit 50 `
-  --format="table(timestamp,jsonPayload.event,jsonPayload.raw_id,jsonPayload.draft_id,jsonPayload.status)"
+  --format="table(timestamp,jsonPayload.event,jsonPayload.draft_id,jsonPayload.status)"
 ```
 
 Verify approver received the notify and sent a Telegram message:
@@ -280,7 +258,6 @@ Required GitHub secrets:
 - `GCP_PROJECT_ID`
 - `GCP_WORKLOAD_IDENTITY_PROVIDER`
 - `GCP_SERVICE_ACCOUNT`
-- `ADMIN_CHAT_ID` (optional; leave empty to use default)
-- `TARGET_CHANNEL_ID` (optional; leave empty to post to admin chat)
+- `WORKSPACE_ID` (workspace identifier for Firestore)
 
 Run the workflow from the Actions tab with the **Deploy** button.
