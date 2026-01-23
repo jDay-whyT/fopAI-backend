@@ -42,6 +42,34 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Debug environment
+        run: |
+          set -euo pipefail
+          pwd
+          ls -la
+          python -c "import sys; print(sys.path)"
+
+      - name: Verify required vars
+        env:
+          WORKSPACE_ID: ${{ vars.WORKSPACE_ID }}
+          WORKSPACE_TITLE: ${{ vars.WORKSPACE_TITLE }}
+          GROUP_CHAT_ID: ${{ vars.GROUP_CHAT_ID }}
+          INGEST_THREAD_ID: ${{ vars.INGEST_THREAD_ID }}
+          REVIEW_THREAD_ID: ${{ vars.REVIEW_THREAD_ID }}
+          PUBLISH_CHANNEL_ID: ${{ vars.PUBLISH_CHANNEL_ID }}
+          GPT_PROFILE: ${{ vars.GPT_PROFILE }}
+          SOURCE_CHATS: ${{ vars.SOURCE_CHATS }}
+        run: |
+          set -euo pipefail
+          test -n "$WORKSPACE_ID" || (echo "Missing WORKSPACE_ID" && exit 1)
+          test -n "$WORKSPACE_TITLE" || (echo "Missing WORKSPACE_TITLE" && exit 1)
+          test -n "$GROUP_CHAT_ID" || (echo "Missing GROUP_CHAT_ID" && exit 1)
+          test -n "$INGEST_THREAD_ID" || (echo "Missing INGEST_THREAD_ID" && exit 1)
+          test -n "$REVIEW_THREAD_ID" || (echo "Missing REVIEW_THREAD_ID" && exit 1)
+          test -n "$PUBLISH_CHANNEL_ID" || (echo "Missing PUBLISH_CHANNEL_ID" && exit 1)
+          test -n "$GPT_PROFILE" || (echo "Missing GPT_PROFILE" && exit 1)
+          test -n "$SOURCE_CHATS" || (echo "Missing SOURCE_CHATS" && exit 1)
+
       - name: Run init_firestore
         env:
           WORKSPACE_ID: ${{ vars.WORKSPACE_ID }}
@@ -54,4 +82,5 @@ jobs:
           SOURCE_CHATS: ${{ vars.SOURCE_CHATS }}
         run: |
           set -euo pipefail
-          python scripts/init_firestore.py
+          export PYTHONPATH="$GITHUB_WORKSPACE"
+          python -m scripts.init_firestore

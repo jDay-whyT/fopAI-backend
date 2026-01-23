@@ -23,6 +23,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify WORKSPACE_ID
+        env:
+          WORKSPACE_ID: ${{ vars.WORKSPACE_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$WORKSPACE_ID" || (echo "Missing WORKSPACE_ID" && exit 1)
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -228,3 +235,5 @@ jobs:
           set -euo pipefail
           echo "Processor URL: $(gcloud run services describe processor --region $REGION --project "$PROJECT_ID" --format='value(status.url)')"
           echo "Approver URL: $(gcloud run services describe approver --region $REGION --project "$PROJECT_ID" --format='value(status.url)')"
+          echo "Processor image: $(gcloud run services describe processor --region $REGION --project "$PROJECT_ID" --format='value(spec.template.spec.containers[0].image)')"
+          echo "Approver image: $(gcloud run services describe approver --region $REGION --project "$PROJECT_ID" --format='value(spec.template.spec.containers[0].image)')"

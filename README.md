@@ -67,7 +67,7 @@ For local development, copy `.env.example` to `.env`.
 
 1) Enable the Firestore API in your GCP project.
 2) Deploy Cloud Run services and the ingest job.
-3) Run `scripts/init_firestore.py` once to seed the workspace + sources (safe to re-run; use `--force-reset` to reset offsets).
+3) Run `python -m scripts.init_firestore` once to seed the workspace + sources (safe to re-run; use `--force-reset` to reset offsets).
 4) Start the ingest job (or scheduler) to begin processing new posts.
 
 > You do **not** need to click “Start collection” in the Firestore console; the init script creates the collections.
@@ -89,7 +89,7 @@ export PUBLISH_CHANNEL_ID="@aifopukr"
 export GPT_PROFILE="default"
 export SOURCE_CHATS="@aifopukr,@nbu_ua,@tax_gov_ua,@verkhovnaradaukrainy,@Minfin_com_ua,@bu911"
 
-python scripts/init_firestore.py
+python -m scripts.init_firestore
 ```
 
 ## Ingest limits (Cloud Run Job)
@@ -259,7 +259,7 @@ Verify Firestore connectivity and that the workspace/sources exist:
 
 ```bash
 export WORKSPACE_ID="fop"
-python scripts/check_firestore.py
+python -m scripts.check_firestore
 ```
 
 ## Cloud Scheduler
