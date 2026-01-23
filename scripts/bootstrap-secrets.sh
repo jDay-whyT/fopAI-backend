@@ -10,7 +10,6 @@ if [[ -z "$PROJECT_ID" ]]; then
 fi
 
 required_secrets=(
-  DB_PASSWORD
   OPENAI_API_KEY
   TG_BOT_TOKEN
   TELEGRAM_API_ID

@@ -10,15 +10,12 @@ from typing import Iterable
 
 import google.auth
 from google.cloud import pubsub_v1
-from sqlalchemy import select, func
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from telethon import TelegramClient
 from telethon.errors import AuthKeyDuplicatedError, BotMethodInvalidError, FloodWaitError
 from telethon.sessions import StringSession
 
-from shared.db import db_session
+from shared.firestore import get_workspace, list_sources, update_source_offsets
 from shared.logging import configure_logging
-from shared.models import offsets, raw_messages
 from shared.settings import settings
 
 DEFAULT_INGEST_LIMIT = 50
@@ -54,32 +51,13 @@ def _normalize_source(value: str) -> str:
     return cleaned
 
 
-def _parse_sources(value: str | None) -> list[str]:
-    raw_items = (value or "").split(",")
-    cleaned_items = [item.strip() for item in raw_items]
-    sources: list[str] = []
-    seen = set()
-    for item in cleaned_items:
-        if not item:
-            continue
-        normalized = _normalize_source(item)
-        if not normalized:
-            continue
-        if normalized in seen:
-            continue
-        if not SOURCE_USERNAME_RE.fullmatch(normalized):
-            raise RuntimeError(
-                "INGEST_SOURCES must contain only Telegram usernames (letters, numbers, underscores) "
-                "without '@'."
-            )
-        sources.append(normalized)
-        seen.add(normalized)
-    if not sources:
+def _source_id_from_entity(value: str) -> str:
+    normalized = _normalize_source(value)
+    if not SOURCE_USERNAME_RE.fullmatch(normalized):
         raise RuntimeError(
-            "INGEST_SOURCES is required and must list Telegram sources "
-            "(comma-separated usernames or numeric IDs)."
+            "Source usernames must contain only letters, numbers, and underscores."
         )
-    return sources
+    return normalized
 
 
 def _get_ingest_limit() -> int:
@@ -104,49 +82,46 @@ def _topic_path(client: pubsub_v1.PublisherClient) -> str:
     return client.topic_path(project_id, settings.pubsub_topic)
 
 
-def _get_offset(source_id: int) -> int | None:
-    with db_session() as connection:
-        existing = connection.execute(
-            select(offsets.c.last_message_id).where(offsets.c.chat_id == source_id)
-        ).fetchone()
-        if existing:
-            return existing[0]
-    return None
+def _message_unix_timestamp(message_date) -> int:
+    if not message_date:
+        return 0
+    return int(message_date.timestamp())
 
 
-def _upsert_offset(source_id: int, last_message_id: int) -> None:
-    with db_session() as connection:
-        stmt = (
-            pg_insert(offsets)
-            .values(chat_id=source_id, last_message_id=last_message_id, updated_at=func.now())
-            .on_conflict_do_update(
-                index_elements=["chat_id"],
-                set_={"last_message_id": last_message_id, "updated_at": func.now()},
-            )
+def _collect_payloads(
+    workspace_id: str,
+    source_id: str,
+    tg_entity: str,
+    entity,
+    messages: Iterable,
+    last_message_id: int,
+) -> tuple[list[dict], int, int]:
+    payloads: list[dict] = []
+    max_message_id = last_message_id
+    max_message_date = 0
+    for message in messages:
+        if message.id is None:
+            continue
+        if message.id <= last_message_id:
+            continue
+        message_date = _message_unix_timestamp(message.date)
+        max_message_id = max(max_message_id, message.id)
+        max_message_date = max(max_message_date, message_date)
+        payloads.append(
+            {
+                "workspace_id": workspace_id,
+                "source_id": source_id,
+                "origin_chat": tg_entity,
+                "origin_message_id": message.id,
+                "origin_message_date": message_date,
+                "origin_text": message.message or "",
+                "entity_id": entity.id,
+                "entity_title": getattr(entity, "title", None),
+                "entity_username": getattr(entity, "username", None),
+            }
         )
-        connection.execute(stmt)
-
-
-def _insert_raw_messages(messages: Iterable[dict]) -> list[dict[str, int]]:
-    inserted_payloads: list[dict[str, int]] = []
-    with db_session() as connection:
-        for message in messages:
-            stmt = (
-                pg_insert(raw_messages)
-                .values(**message)
-                .on_conflict_do_nothing(index_elements=["chat_id", "message_id"])
-                .returning(raw_messages.c.id)
-            )
-            result = connection.execute(stmt).fetchone()
-            if result:
-                inserted_payloads.append(
-                    {
-                        "raw_id": result[0],
-                        "chat_id": message["chat_id"],
-                        "message_id": message["message_id"],
-                    }
-                )
-    return inserted_payloads
+    payloads.sort(key=lambda item: item["origin_message_id"])
+    return payloads, max_message_id, max_message_date
 
 
 async def ingest_once() -> None:
@@ -154,11 +129,30 @@ async def ingest_once() -> None:
     configure_logging()
     if not (settings.telegram_api_id and settings.telegram_api_hash):
         raise RuntimeError("TELEGRAM_API_ID, TELEGRAM_API_HASH are required")
-    if settings.tg_bot_token or os.getenv("TG_BOT_TOKEN"):
+    if os.getenv("TG_BOT_TOKEN"):
         logger.warning("TG_BOT_TOKEN is set but will be ignored; ingest runs in user mode only.")
     telethon_string_session = _validate_telethon_string_session(settings.telethon_string_session)
-    sources = _parse_sources(os.getenv("INGEST_SOURCES"))
     ingest_limit = _get_ingest_limit()
+    workspace = get_workspace(settings.workspace_id)
+    if workspace is None:
+        raise RuntimeError(f"workspace {settings.workspace_id} not found in Firestore")
+    workspace_data = workspace.data
+    logger.info(
+        "ingest_workspace",
+        extra={
+            "event": "ingest_workspace",
+            "workspace_id": workspace.id,
+            "tg_group_chat_id": workspace_data.get("tg_group_chat_id"),
+            "ingest_thread_id": workspace_data.get("ingest_thread_id"),
+            "review_thread_id": workspace_data.get("review_thread_id"),
+            "publish_channel": workspace_data.get("publish_channel"),
+        },
+    )
+
+    sources = list_sources(settings.workspace_id)
+    if not sources:
+        raise RuntimeError("No sources configured in Firestore for this workspace")
+
     logger.info(
         "ingest_start",
         extra={
@@ -174,7 +168,6 @@ async def ingest_once() -> None:
     publisher = _get_pubsub_client()
     topic_path = _topic_path(publisher)
     fetched_count = 0
-    inserted_count = 0
     to_publish_count = 0
     published_count = 0
 
@@ -191,152 +184,178 @@ async def ingest_once() -> None:
             raise SystemExit(1)
         try:
             for source in sources:
+                source_id = source.get("id") or _source_id_from_entity(source.get("tg_entity", ""))
+                tg_entity = source.get("tg_entity")
+                if not tg_entity:
+                    logger.warning(
+                        "ingest_source_missing_tg_entity",
+                        extra={"event": "ingest_source_missing_tg_entity", "source_id": source_id},
+                    )
+                    continue
+                if not source.get("enabled", True):
+                    logger.info(
+                        "ingest_source_disabled",
+                        extra={"event": "ingest_source_disabled", "source_id": source_id},
+                    )
+                    continue
+
                 try:
-                    entity = await client.get_entity(source)
-                    chat_id = entity.id
-                    normalized_source = _normalize_source(source)
-                    entity_username = _normalize_source(getattr(entity, "username", "") or "")
-                    if entity_username and entity_username.casefold() != normalized_source.casefold():
-                        logger.warning(
-                            "ingest_source_skip",
+                    entity = await client.get_entity(tg_entity)
+                except Exception as exc:
+                    logger.warning(
+                        "ingest_source_entity_failed",
+                        extra={"event": "ingest_source_entity_failed", "source_id": source_id, "error": str(exc)},
+                    )
+                    continue
+
+                last_message_id = int(source.get("last_message_id") or 0)
+                bootstrapped = bool(source.get("bootstrapped", False))
+                logger.info(
+                    "ingest_source_fetch",
+                    extra={
+                        "event": "ingest_source_fetch",
+                        "source_id": source_id,
+                        "tg_entity": tg_entity,
+                        "entity_id": entity.id,
+                        "entity_title": getattr(entity, "title", None),
+                        "entity_username": getattr(entity, "username", None),
+                        "last_message_id": last_message_id,
+                        "bootstrapped": bootstrapped,
+                        "ingest_limit": ingest_limit,
+                    },
+                )
+
+                if not bootstrapped:
+                    newest_messages = await client.get_messages(entity, limit=1)
+                    newest = newest_messages[0] if newest_messages else None
+                    if newest and newest.id is not None:
+                        newest_date = _message_unix_timestamp(newest.date)
+                        update_source_offsets(
+                            settings.workspace_id,
+                            source_id,
+                            last_message_id=newest.id,
+                            last_message_date=newest_date,
+                            bootstrapped=True,
+                        )
+                        logger.info(
+                            "ingest_source_bootstrap",
                             extra={
-                                "event": "ingest_source_skip",
-                                "source": normalized_source,
-                                "resolved_username": entity_username,
-                                "reason": "resolved_username_mismatch",
+                                "event": "ingest_source_bootstrap",
+                                "source_id": source_id,
+                                "tg_entity": tg_entity,
+                                "last_message_id": newest.id,
+                                "last_message_date": newest_date,
+                                "message": "bootstrap source, set offset, no publish",
                             },
                         )
-                        continue
-                    last_message_id_before = _get_offset(chat_id)
-                    is_first_run = last_message_id_before is None
-                    logger.info(
-                        "ingest_source_fetch",
-                        extra={
-                            "event": "ingest_source_fetch",
-                            "source": normalized_source,
-                            "entity_id": chat_id,
-                            "entity_title": getattr(entity, "title", None),
-                            "entity_username": getattr(entity, "username", None),
-                            "last_message_id": last_message_id_before,
-                            "is_first_run": is_first_run,
-                            "ingest_limit": ingest_limit,
-                        },
-                    )
-
-                    new_messages = []
-                    max_message_id = last_message_id_before or 0
-                    if is_first_run:
-                        message_iterator = client.iter_messages(
-                            entity,
-                            limit=ingest_limit,
-                        )
                     else:
-                        message_iterator = client.iter_messages(
-                            entity,
-                            min_id=last_message_id_before,
-                            reverse=True,
-                            limit=ingest_limit,
+                        update_source_offsets(
+                            settings.workspace_id,
+                            source_id,
+                            last_message_id=0,
+                            last_message_date=0,
+                            bootstrapped=True,
                         )
-                    async for message in message_iterator:
-                        if message.id is None:
-                            continue
-                        if last_message_id_before is not None and message.id <= last_message_id_before:
-                            continue
-                        max_message_id = max(max_message_id, message.id)
-                        new_messages.append(
-                            {
-                                "chat_id": chat_id,
-                                "message_id": message.id,
-                                "date": message.date,
-                                "text": message.message,
-                                "meta_json": {
-                                    "source": normalized_source,
-                                    "entity_id": chat_id,
-                                    "entity_title": getattr(entity, "title", None),
-                                    "entity_username": getattr(entity, "username", None),
-                                },
-                            }
+                        logger.info(
+                            "ingest_source_bootstrap_empty",
+                            extra={
+                                "event": "ingest_source_bootstrap_empty",
+                                "source_id": source_id,
+                                "tg_entity": tg_entity,
+                                "message": "bootstrap source, no messages found",
+                            },
                         )
-                    if is_first_run:
-                        new_messages.reverse()
+                    continue
 
-                    fetched_count += len(new_messages)
-                    inserted_payloads = _insert_raw_messages(new_messages)
-                    inserted_count += len(inserted_payloads)
-                    if max_message_id > (last_message_id_before or 0):
-                        _upsert_offset(chat_id, max_message_id)
+                message_iterator = client.iter_messages(
+                    entity,
+                    min_id=last_message_id,
+                    reverse=True,
+                    limit=ingest_limit,
+                )
+                new_messages = [message async for message in message_iterator]
+                payloads, max_message_id, max_message_date = _collect_payloads(
+                    settings.workspace_id,
+                    source_id,
+                    tg_entity,
+                    entity,
+                    new_messages,
+                    last_message_id,
+                )
+                fetched_count += len(payloads)
+                to_publish_count += len(payloads)
 
-                    to_publish_count += len(inserted_payloads)
-                    published_for_source = 0
-                    for payload in inserted_payloads:
-                        payload["trace_id"] = str(uuid.uuid4())
-                        payload["source"] = normalized_source
-                        payload["key"] = f"{normalized_source}:{payload['message_id']}"
-                        try:
-                            future = publisher.publish(
-                                topic_path,
-                                json.dumps(payload).encode("utf-8"),
-                                key=payload["key"],
-                            )
-                            message_id = future.result(timeout=15)
-                            published_count += 1
-                            published_for_source += 1
-                            logger.info(
-                                "ingest_pubsub_publish",
-                                extra={
-                                    "event": "ingest_pubsub_publish",
-                                    "message_id": message_id,
-                                    "raw_id": payload["raw_id"],
-                                    "source": normalized_source,
-                                    "entity_id": chat_id,
-                                    "chat_id": chat_id,
-                                    "message_id": payload["message_id"],
-                                    "key": payload["key"],
-                                    "trace_id": payload["trace_id"],
-                                },
-                            )
-                        except Exception as exc:
-                            logger.error(
-                                "Failed to publish Pub/Sub message",
-                                extra={
-                                    "source": normalized_source,
-                                    "raw_id": payload["raw_id"],
-                                    "entity_id": chat_id,
-                                    "chat_id": chat_id,
-                                    "message_id": payload["message_id"],
-                                    "key": payload["key"],
-                                    "trace_id": payload["trace_id"],
-                                    "error_type": type(exc).__name__,
-                                    "error": str(exc),
-                                },
-                            )
+                publish_errors = 0
+                for payload in payloads:
+                    payload["trace_id"] = str(uuid.uuid4())
+                    payload["key"] = f"{source_id}:{payload['origin_message_id']}"
+                    try:
+                        future = publisher.publish(
+                            topic_path,
+                            json.dumps(payload).encode("utf-8"),
+                            key=payload["key"],
+                        )
+                        message_id = future.result(timeout=15)
+                        published_count += 1
+                        logger.info(
+                            "ingest_pubsub_publish",
+                            extra={
+                                "event": "ingest_pubsub_publish",
+                                "message_id": message_id,
+                                "source_id": source_id,
+                                "tg_entity": tg_entity,
+                                "origin_message_id": payload["origin_message_id"],
+                                "key": payload["key"],
+                                "trace_id": payload["trace_id"],
+                            },
+                        )
+                    except Exception as exc:
+                        publish_errors += 1
+                        logger.error(
+                            "Failed to publish Pub/Sub message",
+                            extra={
+                                "source_id": source_id,
+                                "tg_entity": tg_entity,
+                                "origin_message_id": payload["origin_message_id"],
+                                "key": payload["key"],
+                                "trace_id": payload["trace_id"],
+                                "error_type": type(exc).__name__,
+                                "error": str(exc),
+                            },
+                        )
 
-                    logger.info(
-                        "ingest_source_state",
+                if payloads and publish_errors == 0 and max_message_id > last_message_id:
+                    update_source_offsets(
+                        settings.workspace_id,
+                        source_id,
+                        last_message_id=max_message_id,
+                        last_message_date=max_message_date,
+                        bootstrapped=True,
+                    )
+                elif payloads and publish_errors > 0:
+                    logger.warning(
+                        "ingest_source_offset_not_updated",
                         extra={
-                            "event": "ingest_source_state",
-                            "source": normalized_source,
-                            "last_message_id_before": last_message_id_before or 0,
-                            "last_message_id_after": max_message_id if max_message_id > 0 else (last_message_id_before or 0),
-                            "fetched_count": len(new_messages),
-                            "published_count": published_for_source,
+                            "event": "ingest_source_offset_not_updated",
+                            "source_id": source_id,
+                            "reason": "publish_failed",
+                            "publish_errors": publish_errors,
+                            "last_message_id_before": last_message_id,
+                            "last_message_id_after": max_message_id,
                         },
                     )
-                except AuthKeyDuplicatedError:
-                    logger.error("Auth key duplicated. Stop ingest and create a fresh Telethon string session.")
-                    raise SystemExit(1)
-                except BotMethodInvalidError:
-                    logger.error("BotMethodInvalidError: ingest is configured as bot. Exiting.")
-                    raise SystemExit(1)
-                except FloodWaitError as exc:
-                    logger.warning(
-                        "Flood wait hit; exiting ingest.",
-                        extra={"source": source, "wait_seconds": exc.seconds},
-                    )
-                    raise SystemExit(0)
-                except Exception as exc:
-                    logger.exception("Failed ingest", extra={"source": source, "error": str(exc)})
-                    raise SystemExit(1)
+
+                logger.info(
+                    "ingest_source_state",
+                    extra={
+                        "event": "ingest_source_state",
+                        "source_id": source_id,
+                        "last_message_id_before": last_message_id,
+                        "last_message_id_after": max_message_id if publish_errors == 0 else last_message_id,
+                        "fetched_count": len(payloads),
+                        "published_count": len(payloads) - publish_errors,
+                    },
+                )
         finally:
             if to_publish_count == 0:
                 logger.info("No new messages found; nothing to publish.")

@@ -6,7 +6,7 @@ from typing import Any
 
 from openai import OpenAI
 
-from shared.prompts import EDITORIAL_PROMPT_UK
+from shared.gpt_profiles import get_prompt
 from shared.settings import settings
 
 logger = logging.getLogger("openai_client")
@@ -31,11 +31,11 @@ class OpenAIEditor:
             raise ValueError("OPENAI_API_KEY is required to initialize the OpenAI client.")
         self.client = OpenAI(api_key=settings.openai_api_key)
 
-    def summarize(self, text: str) -> dict[str, Any]:
+    def summarize(self, text: str, *, system_prompt: str | None = None) -> dict[str, Any]:
         response = self.client.chat.completions.create(
             model=settings.openai_text_model,
             messages=[
-                {"role": "system", "content": EDITORIAL_PROMPT_UK},
+                {"role": "system", "content": system_prompt or get_prompt(None)},
                 {"role": "user", "content": text},
             ],
             response_format={"type": "json_object"},
